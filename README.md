@@ -54,8 +54,8 @@ AI糊的币安合约量化工具，可自选币对进行合约交易。
 
 1.  **克隆代码仓库:**
 
-    git clone https://your-repo-url/here.git
-    cd your-repo-folder
+    git clone [https://your-repo-url/here.git](https://github.com/hzy11fk/Heyue-bot.git)
+    cd Heyue-bot
 
 2.  **安装所需的Python库:**
 
