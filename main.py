@@ -12,7 +12,7 @@ from web_server import start_web_server
 
 async def main():
     setup_logging()
-    logging.info("===== 启动合约趋势策略 (main2.py) =====")
+    logging.info("===== 启动合约趋势策略 =====")
 
     exchange_client = ExchangeClient(is_futures=True)
 
