@@ -54,12 +54,16 @@ AI糊的币安合约量化工具，可自选币对进行合约交易。
 
 1.  **克隆代码仓库:**
 
-    git clone [https://your-repo-url/here.git](https://github.com/hzy11fk/Heyue-bot.git)
+    ```bash
+    git clone https://github.com/hzy11fk/Heyue-bot.git
     cd Heyue-bot
+    ```
 
 2.  **安装所需的Python库:**
-
+ 
+    ```bash
     pip install -r requirements.txt
+    ```
 
 ### 3. 配置
 
@@ -94,12 +98,14 @@ AI糊的币安合约量化工具，可自选币对进行合约交易。
 ## 如何运行
 
 
-2.  **启动机器人:**
+1.  **启动机器人:**
     在您的终端中运行 `main.py` 脚本：
     
+    ```bash
     python main.py
+    ```
 
-4.  **通过Web UI监控:**
+2.  **通过Web UI监控:**
     机器人启动后，打开您的浏览器，访问终端日志中显示的地址，通常是：
     **`http://0.0.0.0:58182`** 或 **`http://localhost:58182`**
 
