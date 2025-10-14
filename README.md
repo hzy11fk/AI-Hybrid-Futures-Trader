@@ -38,7 +38,7 @@ AI糊的币安合约量化工具，可自选币对进行合约交易。
 | `web_server.py`       | **监控仪表盘 (The Monitoring UI)**: 运行一个`aiohttp` Web服务器，提供实时监控前端页面。                                         |
 | `config.py`           | **中央控制面板 (The Control Panel)**: 集中管理所有策略参数、API密钥加载逻辑和功能开关。                                         |
 | `helpers.py`          | **辅助工具箱 (The Utility Toolkit)**: 包含辅助函数，主要用于设置日志系统和发送Bark通知。                                        |
-| `.env`                | **密码保险箱 (The Vault)**: 用于存放敏感信息，如API密钥和Bark URL，此文件不应上传到代码仓库。                                      |
+| `.env`                | **密码保险箱 (The Vault)**: 用于存放敏感信息，如API密钥和Bark URL。                                      |
 
 ## 快速上手指南
 
