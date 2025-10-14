@@ -1,5 +1,5 @@
 AI糊的币安合约量化工具，可自选币对进行合约交易。
-# 高级动态趋势追踪合约交易机器人 (Advanced Dynamic Trend-Following Futures Bot)
+# 高级动态趋势追踪合约交易机器人 (Adaptive Trend Bot)
 
 这是一款专为币安(Binance)U本位合约设计的全自动量化交易机器人，旨在识别并捕捉市场趋势。它集成了一套复杂的多层风险管理系统、基于历史表现的动态参数自适应调整机制，并配备了一个用于全面监控的实时Web界面。
 其核心策略基于双时间周期共振原理，通过较长周期（如15分钟）确认宏观趋势，在较短周期（如5分钟）寻找回调机会入场。开仓后，策略通过一个智能的两阶段追踪止损系统和金字塔式浮盈加仓策略来精细化地管理头寸，力求在控制风险的同时最大化趋势行情带来的利润。
@@ -55,8 +55,8 @@ AI糊的币安合约量化工具，可自选币对进行合约交易。
 1.  **克隆代码仓库:**
 
     ```bash
-    git clone https://github.com/hzy11fk/Heyue-bot.git
-    cd Heyue-bot
+    git clone https://github.com/hzy11fk/Adaptive-Trend-Bot.git
+    cd Adaptive-Trend-Bot
     ```
 
 2.  **安装所需的Python库:**
