@@ -1,4 +1,4 @@
-# 文件: main2.py (合约策略专用启动器)
+# 文件: main.py (合约策略专用启动器)
 
 import asyncio
 from exchange_client import ExchangeClient
