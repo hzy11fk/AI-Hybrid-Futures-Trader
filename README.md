@@ -93,7 +93,100 @@ AI糊的币安合约量化工具，可自选币对进行合约交易。
     -   `FUTURES_SYMBOLS_LIST`: 您希望机器人交易的币对列表，例如 `["BTC/USDT:USDT", "ETH/USDT:USDT"]`。
     -   `FUTURES_INITIAL_PRINCIPAL`: 您的初始本金，用于精确计算盈亏率。
     -   `FUTURES_LEVERAGE` 和 `FUTURES_RISK_PER_TRADE_PERCENT`: 核心的风险管理参数。
-    -   所有其他参数在文件中都有详细的中文注释。
+  
+## 配置参数详解 (`config.py`)
+
+机器人所有的行为和策略都由该文件中的参数控制。理解每个参数的作用是进行策略调优和风险管理的关键。
+
+### 全局设置 (`Settings`)
+
+这部分主要负责全局开关、API密钥加载、趋势判断的核心参数等。
+
+| 参数名                                     | 中文注释和功能说明                                                                                                                     |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| **模式与交易对** |                                                                                                                                        |
+| `USE_TESTNET`                              | **测试网开关**：`True` 表示使用币安测试网进行模拟交易，`False` 表示使用实盘账户。**强烈建议新用户先设为 `True`**。                   |
+| `FUTURES_SYMBOLS_LIST`                     | **交易对列表**：一个Python列表，定义了机器人需要监控和交易的所有合约交易对。                                                              |
+| `FUTURES_INITIAL_PRINCIPAL`                | **初始本金**：您投入该策略的初始总资金（USDT），用于精确计算总盈亏率和性能指标。                                                         |
+| **API与通知** |                                                                                                                                        |
+| `BINANCE...KEY`                            | **API密钥**：从 `.env` 文件中加载您的币安实盘和测试网API密钥。                                                                            |
+| `BARK_URL_KEY`                             | **Bark推送密钥**：从 `.env` 文件中加载您的Bark App推送地址，用于发送交易通知。                                                            |
+| **核心趋势判断** |                                                                                                                                        |
+| `TREND_SIGNAL_TIMEFRAME`                   | **信号周期**：用于生成主要交易信号的K线时间周期，例如 `'5m'` (5分钟)。                                                                   |
+| `TREND_FILTER_TIMEFRAME`                   | **过滤周期**：用于确认宏观趋势的较长K线时间周期，例如 `'15m'` (15分钟)。                                                                 |
+| `TREND_SHORT_MA_PERIOD`                    | **短期均线周期**：在“信号周期”上计算的短期移动平均线周期。                                                                               |
+| `TREND_LONG_MA_PERIOD`                     | **长期均线周期**：在“信号周期”上计算的长期移动平均线周期。快慢均线的交叉关系是判断趋势的基础。                                           |
+| `TREND_FILTER_MA_PERIOD`                   | **过滤均线周期**：在“过滤周期”上计算的移动平均线，用于判断当前价格处于宏观的多头还是空头环境。                                           |
+| `TREND_ADX_THRESHOLD_STRONG`               | **强趋势ADX阈值**：ADX指标超过此值，表示趋势非常强劲。                                                                                   |
+| `TREND_ADX_THRESHOLD_WEAK`                 | **弱趋势ADX阈值**：ADX指标低于此值，表示趋势非常弱或处于盘整。                                                                           |
+| `TREND_ATR_MULTIPLIER...`                  | **动态阈值ATR乘数**：根据ADX判断的趋势强弱，使用不同的ATR乘数来动态调整MA均线差值的判断阈值，强趋势时要求更低，弱趋势时要求更高。     |
+| **趋势确认与增强** |                                                                                                                                        |
+| `ENABLE_TREND_MEMORY`                      | **趋势记忆开关**：`True` 开启趋势“宽限期”功能。一旦一个趋势通过严格确认，即使短期信号消失，策略也会在几根K线内“记住”这个趋势方向。 |
+| `TREND_CONFIRMATION_GRACE_PERIOD`          | **趋势宽限期K线数**：在趋势记忆开启时，已确认的趋势可以维持多少根K线。                                                                   |
+| `TREND_VOLUME_CONFIRM_PERIOD`              | **成交量均线周期**：用于计算成交量移动平均线(VMA)的周期，作为成交量确认的基准。                                                           |
+| `TREND_RSI_CONFIRM_PERIOD`                 | **RSI周期**：用于计算RSI指标的周期。                                                                                                     |
+| `TREND_RSI_UPPER_BOUND`                    | **RSI上限**：在看涨趋势确认时，要求RSI值低于此数值，避免在超买区域追高。                                                                 |
+| `TREND_RSI_LOWER_BOUND`                    | **RSI下限**：在看跌趋势确认时，要求RSI值高于此数值，避免在超卖区域杀跌。                                                                 |
+| **动态成交量** |                                                                                                                                        |
+| `DYNAMIC_VOLUME_ENABLED`                   | **动态成交量开关**：`True` 开启后，用于确认趋势的成交量阈值将根据市场近期波动率（ATR比率）动态调整。                                     |
+| `DYNAMIC_VOLUME_BASE_MULTIPLIER`           | **基础成交量乘数**：在动态成交量关闭时，或作为动态计算的基础值。要求成交量必须大于 `VMA * 此乘数`。                                       |
+| `DYNAMIC_VOLUME_ATR_PERIOD...`             | **动态成交量ATR周期**：用于计算短期和长期ATR以得出市场波动率比率的周期。                                                                 |
+| `DYNAMIC_VOLUME_ADJUST_FACTOR`             | **动态成交量调整因子**：波动率比率对基础成交量乘数的具体影响程度。                                                                       |
+| **激进模式：突破与激增信号** |                                                                                                                                        |
+| `ENABLE_BREAKOUT_MODIFIER`                 | **突破信号开关**：`True` 开启布林带突破侦测功能。                                                                                        |
+| `BREAKOUT_TIMEFRAME`                       | **突破信号周期**：用于计算布林带的K线时间周期。                                                                                          |
+| `BREAKOUT_BBANDS_PERIOD`                   | **布林带周期**：计算布林带中轨（MA）的周期。                                                                                             |
+| `BREAKOUT_BBANDS_STD_DEV`                  | **布林带标准差**：布林带上下轨的标准差倍数。                                                                                             |
+| `BREAKOUT_GRACE_PERIOD_SECONDS`            | **突破宽限期(秒)**：侦测到突破信号后，策略进入“激进模式”的持续时间。                                                                     |
+| `AGGRESSIVE_PULLBACK_ZONE_MULTIPLIER`      | **激进回调区乘数**：在“激进模式”下，回调入场区的宽度会乘以该系数，变得更大，更容易成交。                                                 |
+| `AGGRESSIVE_RELAXED_VOLUME_MULTIPLIER`     | **激进成交量乘数**：在“激进模式”下，趋势确认所需的成交量阈值会乘以该系数（通常小于1），变得更宽松。                                     |
+| `ENABLE_SPIKE_MODIFIER`                    | **激增信号开关**：`True` 开启K线实体和成交量激增的侦测功能。                                                                              |
+| `SPIKE_TIMEFRAME`                          | **激增信号周期**：用于侦测激增的K线时间周期。                                                                                            |
+| `SPIKE_BODY_ATR_MULTIPLIER`                | **激增K线实体ATR乘数**：要求K线实体大小必须超过 `ATR * 此乘数`。                                                                         |
+| `SPIKE_VOLUME_MULTIPLIER`                  | **激增成交量乘数**：要求实时成交量必须超过 `VMA * 此乘数`。                                                                              |
+| `SPIKE_GRACE_PERIOD_SECONDS`               | **激增宽限期(秒)**：侦测到激增信号后，策略进入“超级激进模式”的持续时间。                                                                 |
+| `SUPER_AGGRESSIVE_PULLBACK_ZONE_MULTIPLIER`| **超级激进回调区乘数**：在“超级激进模式”下，回调区的放大倍数，比普通激进模式更激进。                                                     |
+| `SUPER_AGGRESSIVE_RELAXED_VOLUME_MULTIPLIER` | **超级激进成交量乘数**：在“超级激进模式”下，成交量阈值的放宽系数，比普通激进模式更宽松。                                                 |
+| `SPIKE_ENTRY_GRACE_PERIOD_MINUTES`         | **激增入场保护期(分钟)**：对于因“激增”信号开的仓位，在此保护期内，即使趋势与持仓不符，也不会触发防御性止损。                               |
+| **策略自适应系统** |                                                                                                                                        |
+| `ENABLE_PERFORMANCE_FEEDBACK`              | **表现反馈开关**：`True` 开启策略的自适应调参功能。机器人会根据历史业绩自动在“激进”和“防御”参数集之间动态调整。                     |
+| `PERFORMANCE_CHECK_INTERVAL_HOURS`         | **表现检查间隔(小时)**：每隔多少小时重新评估一次策略表现并调整参数。                                                                     |
+| `MIN_TRADES_FOR_EVALUATION`                | **最少评估交易次数**：在进行参数自适应前，至少需要积累的交易笔数。                                                                       |
+| `PERF_WEIGHT_WIN_RATE`                     | **表现评分权重：胜率**：在计算综合表现分时，胜率所占的比重。                                                                             |
+| `PERF_WEIGHT_PAYOFF_RATIO`                 | **表现评分权重：盈亏比**：盈亏比所占的比重。                                                                                             |
+| `PERF_WEIGHT_DRAWDOWN`                     | **表现评分权重：最大回撤**：最大回撤所占的比重。                                                                                         |
+| `AGGRESSIVE_PARAMS`                        | **激进参数集**：一个字典，当策略表现得分高时，会趋向于采用这套参数（例如，更窄的回调区，更灵敏的ATR止损）。                               |
+| `DEFENSIVE_PARAMS`                         | **防御参数集**：一个字典，当策略表现得分低时，会趋向于采用这套参数（例如，更宽的回调区，更宽松的ATR止损）。                               |
+
+### 合约交易设置 (`FuturesSettings`)
+
+这部分专门存放与合约交易行为直接相关的参数，如杠杆、风险管理、止损、加仓等。
+
+| 参数名                                   | 中文注释和功能说明                                                                                                             |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| **核心交易参数** |                                                                                                                                |
+| `FUTURES_LEVERAGE`                       | **杠杆倍数**：为您所有交易对设置的杠杆倍数。                                                                                     |
+| `FUTURES_MARGIN_MODE`                    | **保证金模式**：`'isolated'` (逐仓) 或 `'crossed'` (全仓)。建议使用 `'isolated'` 以隔离风险。                                     |
+| `FUTURES_RISK_PER_TRADE_PERCENT`         | **单笔交易风险比例**：每次开仓时，您愿意承担的风险占总权益的百分比。该参数是决定开仓大小的核心。                                   |
+| `FUTURES_STOP_LOSS_PERCENT`              | **初始止损百分比**：根据开仓价设置的初始止损距离。例如 `2.5` 表示止损设置在开仓价下方2.5%。                                        |
+| **入场与状态管理** |                                                                                                                                |
+| `FUTURES_ENTRY_PULLBACK_EMA_PERIOD`      | **回调入场EMA周期**：用于计算回调区域中心线的EMA均线周期。                                                                       |
+| `FUTURES_STATE_DIR`                      | **状态文件目录**：用于存放持仓状态和利润记录 `.json` 文件的目录名。                                                              |
+| **防御性止损** |                                                                                                                                |
+| `TREND_EXIT_ADJUST_SL_ENABLED`           | **防御性止损开关**：`True` 开启后，如果持仓方向与当前市场趋势连续多次不符，会自动收紧止损以控制风险。                           |
+| `TREND_EXIT_CONFIRMATION_COUNT`          | **趋势不符确认次数**：需要连续多少根K线的趋势判断与持仓方向不符，才会触发防御性止损。                                              |
+| `TREND_EXIT_ATR_MULTIPLIER`              | **防御止损ATR乘数**：触发防御性止损时，新的止损位将设置在 `当前价 ± ATR * 此乘数` 的位置，通常比追踪止损更紧。                       |
+| **金字塔加仓** |                                                                                                                                |
+| `PYRAMIDING_ENABLED`                     | **金字塔加仓开关**：`True` 开启浮盈加仓功能。                                                                                    |
+| `PYRAMIDING_MAX_ADD_COUNT`               | **最大加仓次数**：在一个盈利的头寸上，最多允许进行多少次加仓操作。                                                               |
+| `PYRAMIDING_ADD_SIZE_RATIO`              | **加仓规模比例**：每次加仓的数量是上一次开仓（或加仓）数量的百分比。例如 `0.75` 表示每次加仓75%，形成倒金字塔。               |
+| **两阶段动态止损** |                                                                                                                                |
+| `CHANDELIER_EXIT_ENABLED`                | **两阶段止损开关**：`True` 开启智能两阶段止损系统（ATR追踪 -> 吊灯止损）。                                                      |
+| `CHANDELIER_ACTIVATION_PROFIT_MULTIPLE`  | **吊灯止损激活盈利倍数**：当浮动盈利达到初始风险(1R)的多少倍时，止损模式从第一阶段自动升级为第二阶段的“吊灯止损”。               |
+| `CHANDELIER_PERIOD`                      | **吊灯止损回顾周期**：用于计算N周期内最高价/最低价的周期数。对于15分钟图，`16` 是一个不错的起点（回顾过去4小时）。               |
+| `CHANDELIER_ATR_MULTIPLIER`              | **吊灯止损ATR乘数**：吊灯止损计算公式中使用的ATR乘数，数值越大，止损越宽松，能给趋势更多“呼吸空间”。常用值为 `3`。               |
+
+
 
 ## 如何运行
 
