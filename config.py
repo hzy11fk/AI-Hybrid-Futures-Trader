@@ -4,155 +4,153 @@ from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 from pydantic import ConfigDict
 
-# 加载 .env 文件中的环境变量
 load_dotenv()
-
-# ==============================================================================
-# 全局设置 (Settings)
-# ==============================================================================
-# 这个类主要负责从.env文件加载密钥、设置全局开关等基础配置。
 
 class Settings(BaseSettings):
     """全局应用程序设置"""
-    # --- 模式与交易对配置 ---
     USE_TESTNET: bool = False
-    FUTURES_SYMBOLS_LIST: list = ["BNB/USDT:USDT", "ETH/USDT:USDT"]
-    FUTURES_INITIAL_PRINCIPAL: float = 100.0  # 请根据您投入的实际初始本金修改此值
-
-    # --- API 密钥 (从 .env 文件读取) ---
+    FUTURES_SYMBOLS_LIST: list = ["BNB/USDT:USDT", "ETH/USDT:USDT", "BTC/USDT:USDT"]
+    FUTURES_INITIAL_PRINCIPAL: float = 289
+    ENABLE_TRENDLINE_FILTER: bool = True
+    TRENDLINE_LOOKBACK_PERIOD: int = 180
+    TRENDLINE_PIVOT_WINDOW: int = 5
+    TRENDLINE_NEARNESS_ATR_MULTIPLIER: float = 0.5
     BINANCE_API_KEY: str = os.getenv("BINANCE_API_KEY", "")
     BINANCE_SECRET_KEY: str = os.getenv("BINANCE_SECRET_KEY", "")
     BINANCE_TESTNET_API_KEY: str = os.getenv("BINANCE_TESTNET_API_KEY", "")
     BINANCE_TESTNET_SECRET_KEY: str = os.getenv("BINANCE_TESTNET_SECRET_KEY", "")
-
-    # --- Bark 推送服务 ---
     BARK_URL_KEY: str = os.getenv("BARK_URL_KEY", "")
-
-    # --- 趋势判断系统核心参数 ---
+    BREAKOUT_TRAIL_STOP_PERCENT: float = 0.003
     TREND_SIGNAL_TIMEFRAME: str = '5m'
     TREND_FILTER_TIMEFRAME: str = '15m'
-    TREND_SHORT_MA_PERIOD: int = 10
-    TREND_LONG_MA_PERIOD: int = 30
-    TREND_FILTER_MA_PERIOD: int = 50
+    TREND_SHORT_MA_PERIOD: int = 7
+    TREND_LONG_MA_PERIOD: int = 21
+    TREND_FILTER_MA_PERIOD: int = 30
     TREND_ADX_THRESHOLD_STRONG: int = 25
     TREND_ADX_THRESHOLD_WEAK: int = 20
-    TREND_ATR_MULTIPLIER_STRONG: float = 1.5
-    TREND_ATR_MULTIPLIER_WEAK: float = 0.7
+    
+    TREND_ATR_MULTIPLIER_STRONG: float = 1.0
+    TREND_ATR_MULTIPLIER_WEAK: float = 0.3
 
-    # --- 趋势判断增强参数 (成交量/动量/记忆) ---
-    ENABLE_TREND_CONFIRMATION: bool = True
+    ENABLE_VOLUME_CONFIRMATION: bool = True
+    ENABLE_RSI_CONFIRMATION: bool = True
+
     ENABLE_TREND_MEMORY: bool = True
     TREND_CONFIRMATION_GRACE_PERIOD: int = 3
     TREND_VOLUME_CONFIRM_PERIOD: int = 20
     TREND_RSI_CONFIRM_PERIOD: int = 14
-    TREND_RSI_UPPER_BOUND: int = 55
-    TREND_RSI_LOWER_BOUND: int = 45
+    TREND_RSI_UPPER_BOUND: int = 60
+    TREND_RSI_LOWER_BOUND: int = 40
 
-    # --- 动态成交量阈值参数 ---
     DYNAMIC_VOLUME_ENABLED: bool = True
     DYNAMIC_VOLUME_BASE_MULTIPLIER: float = 1.5
     DYNAMIC_VOLUME_ATR_PERIOD_SHORT: int = 10
     DYNAMIC_VOLUME_ATR_PERIOD_LONG: int = 50
     DYNAMIC_VOLUME_ADJUST_FACTOR: float = 0.5
 
-    # --- 动量突破入场策略参数 (布林带) ---
-    ENABLE_BREAKOUT_ENTRY: bool = True
-    BREAKOUT_TIMEFRAME: str = '5m'
+    ENABLE_BREAKOUT_MODIFIER: bool = True
+    REQUIRE_FILTER_FOR_AGGRESSIVE: bool = True
+    BREAKOUT_NOMINAL_VALUE_USDT: float = 50.0
+    BREAKOUT_TIMEFRAME: str = '3m'
     BREAKOUT_BBANDS_PERIOD: int = 20
     BREAKOUT_BBANDS_STD_DEV: float = 2.0
+    # --- [核心优化] 新增布林带挤压过滤器配置 ---
+    ENABLE_BBAND_SQUEEZE_FILTER: bool = True       # 是否启用布林带挤压过滤器
+    BBAND_SQUEEZE_LOOKBACK_PERIOD: int = 120        # 判断挤压状态的回看周期 (多少根K线)
+    BBAND_SQUEEZE_THRESHOLD_PERCENTILE: float = 0.25 # 带宽小于过去N周期中25%的时间，则视为挤压
 
-    # --- 突发激增入场策略参数 ---
-    ENABLE_SPIKE_ENTRY: bool = True
+    BREAKOUT_GRACE_PERIOD_SECONDS: int = 300
+    BREAKOUT_GRACE_PERIOD_SECONDS: int = 300
+    AGGRESSIVE_PULLBACK_ZONE_MULTIPLIER: float = 2.0
+    AGGRESSIVE_RELAXED_VOLUME_MULTIPLIER: float = 0.8
+    ENABLE_FUNDING_FEE_SYNC: bool = True
+    ENABLE_SPIKE_MODIFIER: bool = True
     SPIKE_TIMEFRAME: str = '5m'
     SPIKE_BODY_ATR_MULTIPLIER: float = 2.0
     SPIKE_VOLUME_MULTIPLIER: float = 2.5
-
-    # --- 激增/突破信号触发的激进模式参数 ---
-    SPIKE_ENTRY_GRACE_PERIOD_MINUTES: int = 10
-    # -- 激进模式 (由布林带突破激活) --
-    ENABLE_BREAKOUT_MODIFIER: bool = True
-    BREAKOUT_GRACE_PERIOD_SECONDS: int = 180
-    AGGRESSIVE_PULLBACK_ZONE_MULTIPLIER: float = 2.0
-    AGGRESSIVE_RELAXED_VOLUME_MULTIPLIER: float = 0.8
-    # -- 超级激进模式 (由波动/成交量激增激活) --
-    ENABLE_SPIKE_MODIFIER: bool = True
-    SPIKE_GRACE_PERIOD_SECONDS: int = 90
+    SPIKE_GRACE_PERIOD_SECONDS: int = 600
+    SPIKE_ENTRY_CONFIRMATION_BARS: int = 3
     SUPER_AGGRESSIVE_PULLBACK_ZONE_MULTIPLIER: float = 3.0
     SUPER_AGGRESSIVE_RELAXED_VOLUME_MULTIPLIER: float = 0.5
-    AGGRESSIVE_ENTRY_SIZE_MULTIPLIER: float = 1.5
+    SPIKE_ENTRY_GRACE_PERIOD_MINUTES: int = 10
 
-    # --- [核心新增] 资金费用同步配置 ---
-    ENABLE_FUNDING_FEE_SYNC: bool = True       # 是否启用资金费用同步功能
-    FUNDING_FEE_SYNC_INTERVAL_HOURS: int = 1   # 每隔多少小时同步一次资金费用流水
+    ENABLE_RANGING_STRATEGY: bool = True
+    RANGING_TIMEFRAME: str = '15m'
+    RANGING_NOMINAL_VALUE_USDT: float = 40.0
+    RANGING_ADX_THRESHOLD: int = 20
+    RANGING_BBANDS_PERIOD: int = 20
+    RANGING_BBANDS_STD_DEV: float = 2.0
+    RANGING_TAKE_PROFIT_TARGET: str = 'middle'
+    RANGING_STOP_LOSS_ATR_MULTIPLIER: float = 2.0
 
-    # --- 策略表现反馈系统 (自适应参数) ---
-    ENABLE_PERFORMANCE_FEEDBACK: bool = True
+    ENABLE_PULLBACK_QUALITY_FILTER: bool = True
+    PULLBACK_MAX_VOLUME_RATIO: float = 0.8
+
+    ENABLE_ENTRY_MOMENTUM_CONFIRMATION: bool = True
+    ENTRY_RSI_PERIOD: int = 7
+    ENTRY_RSI_CONFIRMATION_BARS: int = 3
+
+    ENABLE_PERFORMANCE_FEEDBACK: bool = False
+    FUNDING_FEE_SYNC_INTERVAL_HOURS: int = 1
     PERFORMANCE_CHECK_INTERVAL_HOURS: int = 4
-    MIN_TRADES_FOR_EVALUATION: int = 5  # 降低门槛以便更快启动
+    MIN_TRADES_FOR_EVALUATION: int = 5
     PERF_WEIGHT_WIN_RATE: float = 0.40
     PERF_WEIGHT_PAYOFF_RATIO: float = 0.25
     PERF_WEIGHT_DRAWDOWN: float = 0.35
 
-    # -- 动态参数的两极：激进型 vs 防御型 --
-    AGGRESSIVE_PARAMS: dict = {
-        "PULLBACK_ZONE_PERCENT": 0.2,
-        "ATR_MULTIPLIER": 2.0,
-        "PYRAMIDING_TRIGGER_PROFIT_MULTIPLE": 0.8
-    }
-    DEFENSIVE_PARAMS: dict = {
-        "PULLBACK_ZONE_PERCENT": 0.6,
-        "ATR_MULTIPLIER": 3.5,
-        "PYRAMIDING_TRIGGER_PROFIT_MULTIPLE": 1.5
-    }
+    BREAKOUT_VOLUME_CONFIRMATION: bool = True
+    BREAKOUT_VOLUME_PERIOD: int = 20
+    BREAKOUT_VOLUME_MULTIPLIER: float = 1.5
 
-    model_config = ConfigDict(
-        env_file=".env",
-        env_file_encoding='utf-8',
-        case_sensitive=True,
-        extra='ignore'
-    )
+    BREAKOUT_RSI_CONFIRMATION: bool = True
+    BREAKOUT_RSI_PERIOD: int = 14
+    BREAKOUT_RSI_THRESHOLD: int = 50
+    AGGRESSIVE_PARAMS: dict = {"PULLBACK_ZONE_PERCENT": 0.2, "ATR_MULTIPLIER": 2.0, "PYRAMIDING_TRIGGER_PROFIT_MULTIPLE": 0.8}
+    DEFENSIVE_PARAMS: dict = {"PULLBACK_ZONE_PERCENT": 0.6, "ATR_MULTIPLIER": 3.5, "PYRAMIDING_TRIGGER_PROFIT_MULTIPLE": 1.5}
 
-# ==============================================================================
-# 合约策略专属设置 (FuturesSettings)
-# ==============================================================================
-# 这个类专门存放与合约交易行为直接相关的参数，与上面的全局/趋势判断参数分离。
+    model_config = ConfigDict(env_file=".env", env_file_encoding='utf-8', case_sensitive=True, extra='ignore')
 
 class FuturesSettings:
-    # --- 核心交易参数 ---
     FUTURES_LEVERAGE: int = 5
     FUTURES_MARGIN_MODE: str = 'isolated'
-    FUTURES_RISK_PER_TRADE_PERCENT: float = 1.5  # 考虑到多币对和加仓，建议使用更保守的1%
-    FUTURES_STOP_LOSS_PERCENT: float = 2.5
+    FUTURES_RISK_PER_TRADE_PERCENT: float = 1.5
+    # --- [核心优化] 新增单笔交易最大保证金占用率 (占总权益) ---
+    MAX_MARGIN_PER_TRADE_RATIO: float = 0.10  # 值为 0.20 代表 20%
+    MIN_NOMINAL_VALUE_USDT: float = 50.0
+    USE_ATR_FOR_INITIAL_STOP: bool = True
+    INITIAL_STOP_ATR_MULTIPLIER: float = 2.5
     
-    # --- 入场与状态管理 ---
     FUTURES_ENTRY_PULLBACK_EMA_PERIOD: int = 10
     FUTURES_STATE_DIR: str = 'data'
-    
-    # --- 趋势不一致时的防御性止损 ---
     TREND_EXIT_ADJUST_SL_ENABLED: bool = True
     TREND_EXIT_CONFIRMATION_COUNT: int = 3
     TREND_EXIT_ATR_MULTIPLIER: float = 1.8
     
-    # --- 金字塔加仓 ---
     PYRAMIDING_ENABLED: bool = True
+    PYRAMIDING_PULLBACK_CHECK_ENABLED: bool = False
     PYRAMIDING_MAX_ADD_COUNT: int = 2
     PYRAMIDING_ADD_SIZE_RATIO: float = 0.75
-    # PYRAMIDING_TRIGGER_PROFIT_MULTIPLE 已被 Settings 中的动态参数取代，此处不再需要
-    # ==============================================================================
-    # --- [核心新增] 两阶段动态止损与吊灯止损 (Chandelier Exit) ---
-    # ==============================================================================
-    # 阶段一：使用 _update_trailing_stop 中的动态ATR参数 (dyn_atr_multiplier)
-    # 阶段二：当盈利达到下面的倍数后，切换到更宽松的吊灯止损以捕捉大趋势
     
-    CHANDELIER_EXIT_ENABLED: bool = True  # 是否启用两阶段止损系统
-    
-    # 从阶段一切换到阶段二的盈利门槛 (单位: R, 即初始风险的倍数)
-    # 例如，设置为 2.0 意味着当浮动盈利达到初始风险的2倍时，自动切换到吊灯止损
+    CHANDELIER_EXIT_ENABLED: bool = True
     CHANDELIER_ACTIVATION_PROFIT_MULTIPLE: float = 2.0
+    CHANDELIER_PERIOD: int = 16
+    CHANDELIER_ATR_MULTIPLIER: float = 2.5
     
-    # 吊灯止损本身的参数
-    CHANDELIER_PERIOD: int = 16  # 计算N周期最高/最低价的周期，22约等于一个月
-    CHANDELIER_ATR_MULTIPLIER: float = 3.0 # ATR 乘数，3是常用值，越大越宽松
-# --- 实例化配置 ---
+    TRAILING_STOP_MIN_UPDATE_SECONDS: int = 60
+    ADAPTIVE_TRAILING_STOP_ENABLED: bool = True
+    TRAILING_STOP_ATR_SHORT_PERIOD: int = 10
+    TRAILING_STOP_ATR_LONG_PERIOD: int = 50
+    TRAILING_STOP_VOLATILITY_PAUSE_THRESHOLD: float = 0.0005
+
+    ENABLE_EXHAUSTION_ALERT: bool = True
+    EXHAUSTION_ADX_PERIOD: int = 14
+    EXHAUSTION_ADX_THRESHOLD: float = 25.0
+    EXHAUSTION_ADX_FALLING_BARS: int = 3
+    
+    # --- [核心修复] 将风险预警设置移动到这里 ---
+    ENABLE_REVERSAL_SIGNAL_ALERT: bool = True       # 是否启用反转型K线风险预警
+    REVERSAL_ALERT_BODY_ATR_MULTIPLIER: float = 1.5   # K线实体必须超过ATR的倍数
+    REVERSAL_ALERT_VOLUME_MULTIPLE: float = 2.0     # K线成交量必须超过均量的倍数
+
 settings = Settings()
 futures_settings = FuturesSettings()
