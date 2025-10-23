@@ -61,7 +61,13 @@ class ExchangeClient:
         # CCXT通常有内置的幂等性处理，但这里我们假设只在超时且状态未知时重试一次。
         # 为简单起见，这里也直接使用重试包装器，但在生产环境中需要更复杂的逻辑。
         return await self._retry_async_method(self.exchange.create_market_order, symbol, side, amount, params=params)
+    async def create_limit_order(self, symbol: str, side: str, amount: float, price: float, params={}):
+        """创建限价单，并应用重试逻辑。"""
+        return await self._retry_async_method(self.exchange.create_limit_order, symbol, side, amount, price, params=params)
 
+    async def cancel_order(self, order_id: str, symbol: str):
+        """取消订单，并应用重Test逻辑。"""
+        return await self._retry_async_method(self.exchange.cancel_order, order_id, symbol=symbol)
     async def fetch_order(self, order_id: str, symbol: str):
         """获取订单信息，并应用重试逻辑。"""
         return await self._retry_async_method(self.exchange.fetch_order, order_id, symbol=symbol)
