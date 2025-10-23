@@ -1,19 +1,33 @@
-# 文件: /root/heyue/main2.py
+# 文件: /root/heyue/main2.py (已修复 .env 加载问题)
+
+# --- [核心修改] 步骤 1: 在所有其他导入之前，首先加载 .env 文件 ---
+from dotenv import load_dotenv
+load_dotenv()
+# --- 修改结束 ---
 
 import asyncio
-import ccxt.pro as ccxtpro # [新增] 导入 ccxt.pro
+import ccxt.pro as ccxtpro
 import logging
-from config import settings
-from exchange_client import ExchangeClient # 确保导入了 ExchangeClient
+from config import settings, futures_settings # 确保也导入了 futures_settings (如果需要)
+from exchange_client import ExchangeClient
 from futures_trader import FuturesTrendTrader
 from web_server import start_web_server
-from helpers import setup_logging # 假设您的 helpers.py 中有 setup_logging
+from helpers import setup_logging
 
 async def main():
     setup_logging() # 初始化日志
     logger = logging.getLogger("Main")
 
-    # --- [核心修改] 步骤 1: 创建真实的 ccxt 交易所对象 ---
+    # --- [核心修改] 步骤 2: 检查 AI_PROVIDER 是否已成功加载 ---
+    # 增加一个启动时的检查，方便排查问题
+    if getattr(settings, 'ENABLE_AI_MODE', False):
+        if not getattr(settings, 'AI_PROVIDER', None):
+            logger.critical("!!! 致命错误: AI模式已启用，但未能从配置文件中加载 AI_PROVIDER。请检查 .env 文件和加载顺序。")
+            return
+        logger.info(f"检测到 AI 服务商配置为: {settings.AI_PROVIDER.upper()}")
+    # --- 修改结束 ---
+
+    # 创建真实的 ccxt 交易所对象
     exchange_config = {
         'apiKey': settings.BINANCE_API_KEY,
         'secret': settings.BINANCE_SECRET_KEY,
@@ -24,20 +38,17 @@ async def main():
             'apiKey': settings.BINANCE_TESTNET_API_KEY,
             'secret': settings.BINANCE_TESTNET_SECRET_KEY,
         })
-        # 注意: ccxt.pro 使用 ccxtpro.binance()
         exchange = ccxtpro.binance(exchange_config)
         exchange.set_sandbox_mode(True)
     else:
         exchange = ccxtpro.binance(exchange_config)
     
-    # --- [核心修改] 步骤 2: 将创建好的交易所对象传递给 ExchangeClient ---
-    # exchange_client 现在是一个包装器，负责处理重试等逻辑
+    # 将创建好的交易所对象传递给 ExchangeClient
     exchange_client = ExchangeClient(exchange)
 
-    # --- 后续逻辑保持不变 ---
     traders = {}
+    # 确保 FUTURES_SYMBOLS_LIST 是从 settings 中获取的
     for symbol in settings.FUTURES_SYMBOLS_LIST:
-        # 将 exchange_client (而不是原始的 exchange) 传递给交易员
         trader = FuturesTrendTrader(exchange=exchange_client, symbol=symbol)
         traders[symbol] = trader
 
@@ -65,12 +76,10 @@ async def main():
         await asyncio.gather(*main_loops)
     except KeyboardInterrupt:
         logger.warning("接收到关闭信号，正在优雅地关闭所有服务...")
-        # 此处可以添加取消 main_loops 任务的逻辑
     finally:
         await web_server_site.stop()
         await exchange.close()
         logger.info("所有服务已完全关闭。程序退出。")
 
 if __name__ == "__main__":
-    # 确保 main2.py 的主函数调用部分是正确的
     asyncio.run(main())
