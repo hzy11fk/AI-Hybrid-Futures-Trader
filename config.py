@@ -110,6 +110,28 @@ class Settings(BaseSettings):
 
     model_config = ConfigDict(env_file=".env", env_file_encoding='utf-8', case_sensitive=True, extra='ignore')
 
+# --- [AI 决策引擎配置] ---
+    ENABLE_AI_MODE: bool = True                     # 是否启用 AI 判断模式
+    AI_ANALYSIS_INTERVAL_MINUTES: int = 15          # AI 分析的周期（分钟）
+    AI_CONFIDENCE_THRESHOLD: int = 80               # AI 判断可用于真实交易的置信度分数阈值 (0-100)
+    AI_ENABLE_LIVE_TRADING: bool = False            # !!! 安全开关 !!! AI达到阈值后是否允许真实下单
+    AI_STATE_DIR: str = 'data'                      # 存储 AI 表现和状态文件的目录
+    AI_PERFORMANCE_LOOKBACK_TRADES: int = 50        # 用于计算表现分数的最近交易笔数
+    AI_MIN_RISK_REWARD_RATIO: float = 1.5
+    # [新增] AI 下单类型配置
+    AI_ORDER_TYPE: str = os.getenv("AI_ORDER_TYPE", "market") # 可选 "market" (市价) 或 "limit" (限价)
+    AI_LIMIT_ORDER_CANCEL_THRESHOLD_PERCENT: float = 0.5    # 价格偏离挂单价 0.5% 时，自动取消挂单
+    # Azure OpenAI API 配置 (从 .env 文件读取)
+    AZURE_OPENAI_ENDPOINT: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    AZURE_OPENAI_KEY: str = os.getenv("AZURE_OPENAI_KEY", "")
+    AZURE_OPENAI_MODEL_NAME: str = os.getenv("AZURE_OPENAI_MODEL_NAME", "") # 例如 "gpt-4-turbo"
+# 确保 AI_PROVIDER 被读取
+    AI_PROVIDER: str = os.getenv("AI_PROVIDER")
+
+# 兼容 OpenAI/DeepSeek 的配置
+    OPENAI_API_BASE: str = os.getenv("OPENAI_API_BASE")
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY")
+    OPENAI_MODEL_NAME: str  = os.getenv("OPENAI_MODEL_NAME")
 class FuturesSettings:
     FUTURES_LEVERAGE: int = 5
     FUTURES_MARGIN_MODE: str = 'isolated'
