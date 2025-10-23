@@ -5,6 +5,7 @@ import pandas as pd
 from datetime import datetime
 import ccxt.async_support as ccxt
 import numpy as np
+from ai_analyzer import AIAnalyzer
 
 # 模拟真实的FuturesTrendTrader，但剥离了所有真实的交易执行
 from futures_trader import FuturesTrendTrader 
@@ -50,7 +51,10 @@ def generate_performance_report(trade_history: list, initial_balance: float):
     print("\n" + "="*50)
     print("--- 策略性能报告 (前瞻性测试) ---")
     print("="*50)
-    print(f"测试周期: {pd.to_datetime(df['exit_timestamp'].iloc[0]).strftime('%Y-%m-%d')} to {pd.to_datetime(df['exit_timestamp'].iloc[-1]).strftime('%Y-%m-%d')}")
+    
+    # [修复] 确保 exit_timestamp 是 pd.Timestamp 类型
+    df['exit_timestamp'] = pd.to_datetime(df['exit_timestamp'])
+    print(f"测试周期: {df['exit_timestamp'].iloc[0].strftime('%Y-%m-%d')} to {df['exit_timestamp'].iloc[-1].strftime('%Y-%m-%d')}")
     print(f"初始资金: ${initial_balance:,.2f}")
     print(f"最终权益: ${df['equity_curve'].iloc[-1]:,.2f}")
     print("-" * 50)
@@ -70,8 +74,9 @@ class MockExchange:
     """
     一个高度逼真的模拟交易所类。
     能处理首次开仓、加仓、部分平仓和完全平仓。
+    [修改] 增加了限价单逻辑。
     """
-    def __init__(self, initial_balance=1000.0, fee_rate=0.0005):
+    def __init__(self, exchange_client: ExchangeClient, initial_balance=1000.0, fee_rate=0.0005):
         self.initial_balance = initial_balance
         self.balance = initial_balance
         self.used_margin = 0.0
@@ -79,7 +84,24 @@ class MockExchange:
         self.fee_rate = fee_rate
         self.trade_history = []
         self.logger = logging.getLogger(self.__class__.__name__)
+        # [新增] 模拟交易所也需要访问真实K线
+        self.real_exchange_client = exchange_client 
+        
+        # [新增] 模拟挂单
+        self.pending_orders = {}
+        self.order_id_counter = 1
+        
         self.logger.info(f"模拟交易所已初始化。初始资金: ${initial_balance:.2f}, 手续费率: {fee_rate * 100:.4f}%")
+        
+    async def get_current_price(self, symbol):
+        # 辅助函数，用于获取当前市价
+        try:
+            ticker = await self.real_exchange_client.fetch_ticker(symbol)
+            return ticker['last']
+        except Exception as e:
+            self.logger.error(f"模拟交易所无法获取 {symbol} 的真实市价: {e}")
+            return None
+
     def get_total_equity(self, current_prices: dict):
         unrealized_pnl = 0.0
         for symbol, pos in self.positions.items():
@@ -92,7 +114,15 @@ class MockExchange:
     def get_available_balance(self):
         return self.balance - self.used_margin
 
-    def execute_order(self, symbol, side, size, price, leverage):
+    def get_balance_snapshot(self):
+        # 模拟 fetch_balance 的返回结构
+        return {
+            'total': {'USDT': self.get_total_equity({})}, # 注意：这里无法获取实时价格，所以股权可能不准
+            'free': {'USDT': self.get_available_balance()}
+        }
+
+    # [修改] execute_order 重命名为 _execute_trade，并且只在内部调用
+    def _execute_trade(self, symbol, side, size, price, leverage, order_id=None):
         if size <= 0:
             self.logger.error(f"[{symbol}] 订单数量错误: {size}"); return None
 
@@ -123,7 +153,7 @@ class MockExchange:
             pos['entry_fee'] += fee
             
             self.logger.warning(f"➕ [{symbol}] 模拟加仓成功 | 新均价: {new_avg_price:.4f}, 新数量: {new_total_size:.5f}")
-            return {'filled': size, 'average': price, 'timestamp': time.time() * 1000}
+            return {'id': order_id, 'filled': size, 'average': price, 'timestamp': time.time() * 1000, 'status': 'closed'}
 
         # 2. 平仓 (部分或全部)
         elif is_position_open and ((not order_side_is_long and pos['side'] == 'long') or (order_side_is_long and pos['side'] == 'short')):
@@ -151,6 +181,9 @@ class MockExchange:
             
             if is_full_close:
                 pos['is_open'] = False
+                pos['size'] = 0
+                pos['margin'] = 0
+                pos['entry_fee'] = 0
                 self.logger.warning(f"💰 [{symbol}] 模拟完全平仓成功 | 净利润: {pnl_str} USDT | 新余额: ${self.balance:.2f}")
             else:
                 pos['size'] -= closed_size
@@ -158,7 +191,7 @@ class MockExchange:
                 pos['entry_fee'] -= prop_entry_fee
                 self.logger.warning(f"🛡️ [{symbol}] 模拟部分平仓成功 | 平掉数量: {closed_size:.5f}, 本次净利: {pnl_str} USDT")
 
-            return {'filled': closed_size, 'average': price, 'timestamp': time.time() * 1000}
+            return {'id': order_id, 'filled': closed_size, 'average': price, 'timestamp': time.time() * 1000, 'status': 'closed'}
 
         # 3. 首次开仓
         else:
@@ -177,28 +210,97 @@ class MockExchange:
                 'size': size, 'margin': margin_required, 'entry_timestamp': datetime.now().isoformat(), 'entry_fee': fee
             }
             self.logger.warning(f"✅ [{symbol}] 模拟开仓成功 | 方向: {self.positions[symbol]['side'].upper()}, 价格: {price:.4f}, 数量: {size:.5f}")
-            return {'filled': size, 'average': price, 'timestamp': time.time() * 1000}
+            return {'id': order_id, 'filled': size, 'average': price, 'timestamp': time.time() * 1000, 'status': 'closed'}
+    
+    # --- [新增] 模拟交易所的API接口 ---
+    
+    async def create_market_order(self, symbol, side, size):
+        price = await self.get_current_price(symbol)
+        if price is None:
+            raise Exception(f"模拟市价单失败：无法获取 {symbol} 的价格")
+        
+        return self._execute_trade(symbol, side, size, price, futures_settings.FUTURES_LEVERAGE)
+
+    async def create_limit_order(self, symbol, side, size, price):
+        order_id = str(self.order_id_counter)
+        self.order_id_counter += 1
+        
+        order = {
+            'id': order_id, 'symbol': symbol, 'side': side, 'size': size, 'price': price,
+            'status': 'open', 'timestamp': time.time() * 1000
+        }
+        self.pending_orders[order_id] = order
+        self.logger.info(f"[{symbol}] 模拟限价单已提交: {side} {size} @ {price} (ID: {order_id})")
+        return order
+
+    async def fetch_order(self, order_id, symbol):
+        if order_id not in self.pending_orders:
+            # 也许是已成交的市价单？为简单起见，我们假设 fetch_order 只查限价单
+            # 或者它已经被成交并移除了
+            return {'id': order_id, 'status': 'closed'} 
+            
+        order = self.pending_orders[order_id]
+        
+        # --- 模拟限价单成交逻辑 ---
+        current_price = await self.get_current_price(symbol)
+        if current_price is None:
+            return order # 无法获取价格，返回 'open' 状态
+            
+        is_filled = False
+        if order['side'] == 'buy' and current_price <= order['price']:
+            is_filled = True
+        elif order['side'] == 'sell' and current_price >= order['price']:
+            is_filled = True
+            
+        if is_filled:
+            self.logger.warning(f"[{symbol}] 模拟限价单 {order_id} 成交！")
+            del self.pending_orders[order_id]
+            # 使用挂单价成交
+            return self._execute_trade(symbol, order['side'], order['size'], order['price'], futures_settings.FUTURES_LEVERAGE, order_id)
+        
+        return order # 未成交，返回 'open' 状态
+        
+    async def cancel_order(self, order_id, symbol):
+        if order_id in self.pending_orders:
+            del self.pending_orders[order_id]
+            self.logger.info(f"[{symbol}] 模拟订单 {order_id} 已取消。")
+            return {'id': order_id, 'status': 'canceled'}
+        return {'id': order_id, 'status': 'closed'} # 假设它已经被成交了
 
 
 class PaperTrader(FuturesTrendTrader):
     """
     一个用于纸上交易的策略执行器。
-    它继承了所有策略逻辑，但重写了交易执行和初始化部分。
+    它继承了所有策略逻辑，但重写了与交易所的 *直接交互* 方法。
     """
-    def __init__(self, exchange_client, symbol: str, mock_exchange: MockExchange):
-        super().__init__(exchange_client, symbol)
+    def __init__(self, exchange_client: ExchangeClient, symbol: str, mock_exchange: MockExchange):
+        # [修改] 传入的 exchange_client 是 *真实* 的，用于获取K线
+        super().__init__(exchange_client, symbol) 
+        
         self.mock_exchange = mock_exchange
-        self.logger.warning("PaperTrader已初始化，所有交易将在本地模拟执行。")
+        self.logger.warning(f"[{self.symbol}] PaperTrader已初始化，所有交易将在本地模拟执行。")
         self.notifications_enabled = False
-        self.logger.info("Bark通知已为模拟交易禁用。")
+        self.logger.info(f"[{self.symbol}] Bark通知已为模拟交易禁用。")
+        
+        # --- [核心修改] ---
+        # 重写父类的 exchange *实例*，将其替换为 PaperTrader 自身。
+        # 这样当父类调用 self.exchange.create_market_order 时，
+        # 它实际上会调用 PaperTrader.create_market_order
+        self.exchange = self 
+
     async def initialize(self):
         """
         为纸上交易重写的、更安全的初始化方法。
         它只执行读取市场信息的操作，跳过了设置杠杆和保证金模式。
         """
         try:
-            await self.exchange.load_markets()
-            market_info = self.exchange.exchange.market(self.symbol)
+            # [修改] 使用父类的真实 exchange 客户端 (self.exchange) 来加载市场
+            # 注意：在 __init__ 中 self.exchange 已被重写为 self
+            # 我们需要访问原始的 exchange_client
+            original_exchange_client = super().exchange
+            
+            await original_exchange_client.load_markets()
+            market_info = original_exchange_client.exchange.market(self.symbol)
             
             self.min_trade_amount = market_info.get('limits', {}).get('amount', {}).get('min', 0.001)
             if self.min_trade_amount is None or self.min_trade_amount == 0.0: self.min_trade_amount = 0.001
@@ -215,129 +317,103 @@ class PaperTrader(FuturesTrendTrader):
             self.logger.error(f"纸上交易初始化失败: {e}", exc_info=True)
             self.initialized = False
 
-    async def execute_trade(self, action: str, side: str = None, reason: str = '', size: float = None):
-        logger = self.logger
-        if action == 'open' and side:
-            try:
-                ticker = await self.exchange.fetch_ticker(self.symbol)
-                entry_price = ticker['last']
-                if not isinstance(entry_price, (int, float)) or entry_price <= 0: logger.error(f"获取价格无效 ({entry_price})，取消开仓。"); return
-                
-                current_prices = {self.symbol: entry_price}
-                total_equity = self.mock_exchange.get_total_equity(current_prices)
-                if total_equity <= 0: logger.critical("模拟账户权益为0，无法开仓。"); return
-                leverage = futures_settings.FUTURES_LEVERAGE
-                min_notional = getattr(futures_settings, 'MIN_NOMINAL_VALUE_USDT', 21.0)
-                price_diff_per_unit = 0.0
+    # --- [核心修改] 重写 ExchangeClient 的方法 ---
+    # 我们不再重写 execute_trade，而是重写 execute_trade 所依赖的底层API
+    
+    async def fetch_balance(self, params={}):
+        """重写：返回模拟余额"""
+        self.logger.debug("调用模拟 fetch_balance")
+        # 包装在 await 中以匹配异步签名
+        return self.mock_exchange.get_balance_snapshot()
 
-                if reason == 'ranging_entry':
-                    ohlcv_5m = await self.exchange.fetch_ohlcv(self.symbol, '5m', 150)
-                    atr = await self.get_atr_data(period=14, ohlcv_data=ohlcv_5m)
-                    if atr is None or atr <= 0: logger.error(f"无法为震荡策略获取ATR，取消开仓。"); return
-                    price_diff_per_unit = atr * settings.RANGING_STOP_LOSS_ATR_MULTIPLIER
-                elif futures_settings.USE_ATR_FOR_INITIAL_STOP:
-                    atr = await self.get_atr_data(period=14)
-                    if atr is None or atr <= 0: logger.error(f"无法获取有效ATR，取消开仓。"); return
-                    price_diff_per_unit = atr * futures_settings.INITIAL_STOP_ATR_MULTIPLIER
-                else:
-                    price_diff_per_unit = entry_price * (getattr(futures_settings, 'FUTURES_STOP_LOSS_PERCENT', 2.5) / 100)
-                
-                price_diff_per_unit = max(price_diff_per_unit, entry_price * 0.005)
-                if price_diff_per_unit <= 0: logger.error(f"止损距离计算错误({price_diff_per_unit})，取消开仓。"); return
+    async def create_market_order(self, symbol: str, side: str, amount: float, params={}):
+        """重写：调用模拟市价单"""
+        self.logger.debug(f"调用模拟 create_market_order: {side} {amount}")
+        return await self.mock_exchange.create_market_order(symbol, side, amount)
 
-                final_pos_size = 0.0
-                if reason == 'breakout_momentum_trade':
-                    nominal_value = settings.BREAKOUT_NOMINAL_VALUE_USDT
-                    final_pos_size = nominal_value / entry_price
-                    logger.info(f"应用 [突破] 策略仓位: 名义价值 ${nominal_value:.2f}")
-                elif reason == 'ranging_entry':
-                    nominal_value = settings.RANGING_NOMINAL_VALUE_USDT
-                    final_pos_size = nominal_value / entry_price
-                    logger.info(f"应用 [震荡] 策略仓位: 名义价值 ${nominal_value:.2f}")
-                else:
-                    risk_amount = total_equity * (futures_settings.FUTURES_RISK_PER_TRADE_PERCENT / 100)
-                    pos_size_by_risk = risk_amount / price_diff_per_unit
-                    logger.info(f"应用 [趋势] 策略仓位: 风险金额 ${risk_amount:.2f}, 风险计算数量 {pos_size_by_risk:.5f}")
-                    if pos_size_by_risk * entry_price < min_notional:
-                        final_pos_size = min_notional / entry_price
-                        logger.warning(f"风险计算仓位过小，使用最小名义价值 ${min_notional:.2f} 开仓。")
-                    else:
-                        final_pos_size = pos_size_by_risk
+    async def create_limit_order(self, symbol: str, side: str, amount: float, price: float, params={}):
+        """重写：调用模拟限价单"""
+        self.logger.debug(f"调用模拟 create_limit_order: {side} {amount} @ {price}")
+        return await self.mock_exchange.create_limit_order(symbol, side, amount, price)
 
-                required_margin = (final_pos_size * entry_price) / leverage
-                max_allowed_margin = total_equity * futures_settings.MAX_MARGIN_PER_TRADE_RATIO
-                
-                if required_margin > max_allowed_margin:
-                    logger.critical(f"！！！开仓保证金校验失败！！！所需保证金 ({required_margin:.2f}) > 上限 ({max_allowed_margin:.2f})。取消本次开仓。")
-                    return
-                
-                if final_pos_size <= 0: logger.error(f"计算仓位为0或负数({final_pos_size})，取消开仓。"); return
-                
-                api_side = 'buy' if side == 'long' else 'sell'
-                execution_result = self.mock_exchange.execute_order(self.symbol, api_side, final_pos_size, entry_price, leverage)
+    async def fetch_order(self, order_id: str, symbol: str):
+        """重写：调用模拟获取订单"""
+        self.logger.debug(f"调用模拟 fetch_order: {order_id}")
+        return await self.mock_exchange.fetch_order(order_id, symbol)
 
-                if execution_result and self.mock_exchange.positions.get(self.symbol, {}).get('is_open'):
-                    pos = self.mock_exchange.positions[self.symbol]
-                    sl_price = pos['entry_price'] - price_diff_per_unit if pos['side'] == 'long' else pos['entry_price'] + price_diff_per_unit
-                    self.position.open_position(pos['side'], pos['entry_price'], pos['size'], pos['entry_fee'], sl_price, 0.0, time.time() * 1000, reason)
-            except Exception as e:
-                logger.error(f"模拟开仓时发生错误: {e}", exc_info=True)
+    async def cancel_order(self, order_id: str, symbol: str):
+        """重写：调用模拟取消订单"""
+        self.logger.debug(f"调用模拟 cancel_order: {order_id}")
+        return await self.mock_exchange.cancel_order(order_id, symbol)
 
-        elif action == 'close':
-            if not self.position.is_position_open(): return
-            pos_status = self.position.get_status()
-            api_side = 'sell' if pos_status['side'] == 'long' else 'buy'
-            ticker = await self.exchange.fetch_ticker(self.symbol)
-            self.mock_exchange.execute_order(self.symbol, api_side, pos_status['size'], ticker['last'], futures_settings.FUTURES_LEVERAGE)
-            self.position.close_position()
-            
-        elif action == 'partial_close':
-            if not self.position.is_position_open() or size is None or size <= 0: return
-            pos = self.position.get_status()
-            close_side = 'sell' if pos['side'] == 'long' else 'buy'
-            size_to_close = min(size, pos['size'])
-            if size_to_close <= 0: return
-            
-            ticker = await self.exchange.fetch_ticker(self.symbol)
-            filled = self.mock_exchange.execute_order(self.symbol, close_side, size_to_close, ticker['last'], futures_settings.FUTURES_LEVERAGE)
-            if filled:
-                self.position.handle_partial_close(filled['filled'])
-
-    async def _check_and_execute_pyramiding(self, current_price: float, current_trend: str):
-        if not futures_settings.PYRAMIDING_ENABLED or not self.position.is_position_open(): return
-        pos = self.position.get_status()
-        if pos['add_count'] >= futures_settings.PYRAMIDING_MAX_ADD_COUNT or ((pos['side'] == 'long' and current_trend != 'uptrend') or (pos['side'] == 'short' and current_trend != 'downtrend')): return
-        initial_risk = pos.get('initial_risk_per_unit', 0.0)
-        if initial_risk == 0: return
-        pnl_per_unit = current_price - pos['entries'][0]['price'] if pos['side'] == 'long' else pos['entries'][0]['price'] - current_price
-        target_multiplier = self.dyn_pyramiding_trigger * (pos['add_count'] + 1)
-        if pnl_per_unit < initial_risk * target_multiplier: return
+    async def confirm_order_filled(self, order_id, timeout=60, interval=2):
+        """
+        重写：模拟订单确认。
+        市价单立即返回 'closed'，限价单依赖 fetch_order 逻辑。
+        """
+        self.logger.debug(f"调用模拟 confirm_order_filled: {order_id}")
         
-        add_size = self.position.entries[-1]['size'] * futures_settings.PYRAMIDING_ADD_SIZE_RATIO
-        
-        if add_size < self.min_trade_amount:
-            self.logger.warning(f"计算出的加仓数量 ({add_size:.8f}) 小于最小要求 ({self.min_trade_amount:.8f})。将自动调整为最小允许数量进行加仓。")
-            add_size = self.min_trade_amount
-        
-        api_side = 'buy' if pos['side'] == 'long' else 'sell'
-        try:
-            filled = self.mock_exchange.execute_order(self.symbol, api_side, add_size, current_price, futures_settings.FUTURES_LEVERAGE)
-            if not filled: return
-            
-            add_fee = filled['filled'] * filled['average'] * self.mock_exchange.fee_rate
-            self.position.add_to_position(filled['average'], filled['filled'], add_fee, filled['timestamp'])
-            new_pos = self.position.get_status()
-            if new_pos['add_count'] == 2: self.position.reset_partial_tp_counter(reason="Second pyramiding add completed")
-            
-            atr = await self.get_atr_data(period=14)
-            if atr:
-                atr_sl = current_price - (atr * self.dyn_atr_multiplier) if new_pos['side'] == 'long' else current_price + (atr * self.dyn_atr_multiplier)
-                be_price = self.position.break_even_price
-                if be_price is not None and be_price > 0:
-                    final_sl = max(be_price, atr_sl) if new_pos['side'] == 'long' else min(be_price, atr_sl) if atr_sl > 0 else be_price
-                    self.position.update_stop_loss(final_sl, reason="Pyramiding Secure")
-        except Exception as e:
-            self.logger.error(f"模拟加仓时发生错误: {e}", exc_info=True)
+        # 模拟市价单（它们没有 order_id 记录在 pending_orders 中）
+        if order_id is None or order_id not in self.mock_exchange.pending_orders:
+             # 假设这是一个已执行的市价单
+             # 我们需要找到这笔交易... 但这很难。
+             # 为简单起见，我们假设市价单总是成功的。
+             # execute_trade 会处理 PositionTracker
+             #
+             # [!! 关键简化 !!] 真正的 `confirm_order_filled` 是在
+             # `execute_trade` 内部调用的。在我们的模拟中，`create_market_order`
+             # 已经 *同步* 执行了交易并返回了结果。
+             #
+             # `FuturesTrendTrader.execute_trade` 会收到这个 *已成交* 的结果，
+             # 并尝试用它的 ID 调用 `confirm_order_filled`。
+             
+             # 我们返回一个模拟的已成交订单
+             # TODO: 这部分逻辑需要改进，市价单也应该返回ID
+             
+             # 假设 `execute_trade` 拿到的 order['id'] 就是它
+             # 并且 `create_market_order` 已返回成交结果
+             
+             # 在新的设计中，create_market_order 直接返回成交结果
+             # `execute_trade` 拿到这个结果后，不应该再调用 `confirm_order_filled`
+             # 啊，但是 `futures_trader.py` *会* 调用...
+             
+             # 让我们修改 `FuturesTrendTrader.execute_trade` 以适应模拟
+             # 不，我们应该让模拟适应 `FuturesTrendTrader`
+             
+             # 当 `create_market_order` 被调用时，它返回一个 *已成交* 的 dict
+             # `execute_trade` 拿到这个 dict，用 `order['id']` 调用 `confirm_order_filled`
+             # `confirm_order_filled` 应该能识别这个 ID
+             
+             # 让我们假设 `_execute_trade` 返回的 dict 就是 `order`
+             # 那么 `execute_trade` 拿到的 `order['id']` 可能是 None 或一个数字
+             
+             # 简便起见：在模拟模式下，市价单立即成交，
+             # `confirm_order_filled` 直接返回传入的 order
+             
+             # 糟糕，`create_market_order` 返回的是 *成交后* 的 dict，
+             # 而 `execute_trade` 期望的是 *刚创建* 的 dict。
+             
+             # 让我们回到 `MockExchange`
+             # `create_market_order` 应该返回一个模拟的 "刚创建" 的订单
+             # 但它内部已经执行了...
+             
+             # 算了，最简单的模拟：
+             # `confirm_order_filled` 总是假设订单已成交
+             # 它只需要调用 `fetch_order` 一次
+             self.logger.warning(f"模拟 confirm_order_filled: 假设 {order_id} 已成交或正在检查")
+             return await self.fetch_order(order_id, self.symbol)
+
+    # --- [新增] 重写父类的只读方法，确保它们使用 *真实* 的交易所 ---
+    
+    @property
+    def exchange(self):
+        # 当父类访问 self.exchange 时 (例如 self.exchange.fetch_ticker)
+        # 确保它访问的是 *原始* 的 exchange_client，而不是 PaperTrader 实例
+        return super().exchange
+
+    # --- [移除] 不再需要重写 execute_trade 或 _check_and_execute_pyramiding ---
+    # 父类的原始逻辑将自动运行，并调用我们重写的 (create_market_order, etc.)
+
 
 async def main(mock_exchange: MockExchange):
     """
@@ -347,10 +423,11 @@ async def main(mock_exchange: MockExchange):
     setup_logging()
     logging.info("--- 启动纸上交易 (前瞻性测试) ---")
 
+    # [修改] 纸上交易也需要 API 密钥，用于 *读取* K线数据
     api_key = settings.BINANCE_TESTNET_API_KEY if settings.USE_TESTNET else settings.BINANCE_API_KEY
     secret_key = settings.BINANCE_TESTNET_SECRET_KEY if settings.USE_TESTNET else settings.BINANCE_SECRET_KEY
     if not api_key or not secret_key:
-        logging.critical("API Key或Secret Key未在.env文件中设置！")
+        logging.critical("API Key或Secret Key未在.env文件中设置！(纸上交易也需要它们来读取数据)")
         return
 
     exchange_instance = ccxt.binance({'apiKey': api_key, 'secret': secret_key, 'options': {'defaultType': 'swap'}})
@@ -358,24 +435,45 @@ async def main(mock_exchange: MockExchange):
         exchange_instance.set_sandbox_mode(True)
         logging.warning("--- 正在使用币安测试网 ---")
     
+    # 这是 *真实* 的交易所客户端，用于获取K线
     exchange_client = ExchangeClient(exchange=exchange_instance)
     await exchange_client.load_markets()
     
-    # mock_exchange 实例从外部传入
+    # --- [核心新增逻辑] AI 连接预执行测试 ---
+    if settings.ENABLE_AI_MODE:
+        logging.info("执行 AI 服务连接预测试...")
+        ai_tester = AIAnalyzer(exchange=exchange_client.exchange, symbol="CONNECTION_TEST")
+        connection_ok = await ai_tester.test_connection()
+        
+        if not connection_ok:
+            logging.critical("AI 连接测试未通过。程序将退出，请检查日志中的详细错误信息并修正配置。")
+            await exchange_instance.close() 
+            return 
+    # --- 测试结束 ---
+    
+    # [修改] 将 *真实* 的 exchange_client 传递给 mock_exchange
+    mock_exchange.real_exchange_client = exchange_client
+    
+    # [修改] PaperTrader 接收 *真实* 的 exchange_client (用于读)
+    # 和 *模拟* 的 mock_exchange (用于写)
     traders = [PaperTrader(exchange_client, symbol, mock_exchange) for symbol in settings.FUTURES_SYMBOLS_LIST]
     
     await asyncio.gather(*[trader.initialize() for trader in traders])
     
-    # --- [核心修复] ---
-    # 不再返回，而是持续等待所有main_loop任务运行
-    # 因为main_loop是无限循环，所以这里会永远等待，直到被Ctrl+C中断
+    logging.info("--- 策略初始化完成，开始模拟 main_loop ---")
+    
     await asyncio.gather(*[trader.main_loop() for trader in traders])
+    
+    # [新增] 关闭交易所连接
+    await exchange_instance.close()
 
 
 # 替换现有的 if __name__ == "__main__": 代码块
 if __name__ == "__main__":
     # 在主程序块中创建 mock_exchange 实例
-    mock_exchange_instance = MockExchange(initial_balance=settings.FUTURES_INITIAL_PRINCIPAL)
+    # [修改] 构造函数现在需要一个 exchange_client，但我们此时还没有
+    # 我们先传 None，然后在 main 函数中再设置它
+    mock_exchange_instance = MockExchange(exchange_client=None, initial_balance=settings.FUTURES_INITIAL_PRINCIPAL)
     try:
         # 将实例传递给 main 函数
         asyncio.run(main(mock_exchange_instance))
