@@ -1,23 +1,23 @@
-# 文件: futures_trader.py (最终修正版 - 修复ROUND_UP调用)
-
 import logging
 import asyncio
 import time
 import numpy as np
 import pandas as pd
-import ccxt # <--- [核心修正] 导入 ccxt 库本身
+import ccxt
 from ccxt.base.errors import ExchangeError, NetworkError, InsufficientFunds
 from config import futures_settings, settings
 from position_tracker import PositionTracker
-from helpers import send_bark_notification
-from profit_tracker import ProfitTracker # <--- [新增] 导入新的利润跟踪器
+from helpers import send_bark_notification, extract_fee
+from profit_tracker import ProfitTracker
 from enum import Enum
+
 class Trend(Enum):
     UP = "up"
     DOWN = "down"
     NEUTRAL = "neutral"
 
 class FuturesTrendTrader:
+    
     
     def __init__(self, exchange, symbol: str):
         self.exchange = exchange
@@ -28,79 +28,91 @@ class FuturesTrendTrader:
         self.last_status_log_time = 0
         self.last_trend_analysis = {}
         self.last_spike_analysis = {}
-        
+        self.last_breakout_analysis = {}
+        self.last_breakout_timestamp = 0
         self.profit_tracker = ProfitTracker(
-            state_dir=futures_settings.FUTURES_STATE_DIR, 
+            state_dir=futures_settings.FUTURES_STATE_DIR,
             symbol=self.symbol,
             initial_principal=settings.FUTURES_INITIAL_PRINCIPAL
         )
-        
+        self.last_trendline_analysis = {}
         self.trend_exit_counter = 0
         self.trend_confirmed_state = 'sideways'
         self.trend_grace_period_counter = 0
         self.trend_confirmation_timestamp = 0
-        # --- [核心重构] 统一的激进模式状态管理 ---
-        self.aggressive_mode_until = 0  # 激进模式的截止时间戳
-        self.aggression_level = 0       # 激进等级: 0=常规, 1=激进(突破), 2=超级激进(激增)
-        # --- [核心新增] 资金费用同步的计时器 ---
-        self.last_funding_check_time = 0
 
+        self.aggressive_mode_until = 0
+        self.aggression_level = 0
+        self.last_spike_timestamp = 0
+        self.last_funding_check_time = 0
         self.last_perf_check_time = 0
+        self.notifications_enabled = True
+        # --- [核心修改] 新增用于UI展示的状态字典 ---
+        self.last_momentum_analysis = {}
+        self.last_exhaustion_analysis = {}
+        self.last_trailing_stop_update_time = 0
+
+        self.taker_fee_rate = 0.0005
+        self.min_trade_amount = 0.001
+
         self.dyn_pullback_zone_percent = (settings.AGGRESSIVE_PARAMS['PULLBACK_ZONE_PERCENT'] + settings.DEFENSIVE_PARAMS['PULLBACK_ZONE_PERCENT']) / 2
         self.dyn_atr_multiplier = (settings.AGGRESSIVE_PARAMS['ATR_MULTIPLIER'] + settings.DEFENSIVE_PARAMS['ATR_MULTIPLIER']) / 2
         self.dyn_pyramiding_trigger = (settings.AGGRESSIVE_PARAMS['PYRAMIDING_TRIGGER_PROFIT_MULTIPLE'] + settings.DEFENSIVE_PARAMS['PYRAMIDING_TRIGGER_PROFIT_MULTIPLE']) / 2
 
-
     async def _sync_funding_fees(self):
-        """[修正] 定期同步交易所的资金费用流水，使用币安特定的API方法和正确的symbol格式"""
-        if not settings.ENABLE_FUNDING_FEE_SYNC:
-            return
-
+        if not settings.ENABLE_FUNDING_FEE_SYNC: return
         current_time = time.time()
-        if current_time - self.last_funding_check_time < settings.FUNDING_FEE_SYNC_INTERVAL_HOURS * 3600:
-            return
-
+        if current_time - self.last_funding_check_time < settings.FUNDING_FEE_SYNC_INTERVAL_HOURS * 3600: return
         self.logger.info("开始同步资金费用流水...")
         try:
             last_ts = self.profit_tracker.last_funding_fee_timestamp
             since = last_ts + 1 if last_ts > 0 else None
-
-            # --- [核心修正] ---
-            # 1. 从ccxt获取币安API所需的原生symbol格式 (例如, 'BNB/USDT:USDT' -> 'BNBUSDT')
             market = self.exchange.exchange.market(self.symbol)
-            binance_native_symbol = market['id']
-
-            # 2. 准备API所需的参数
-            params = {
-                'symbol': binance_native_symbol, # 使用原生格式的symbol
-                'incomeType': 'FUNDING_FEE'
-            }
-            if since:
-                params['startTime'] = since
-
-            # 3. 使用币安U本位合约专用的隐式方法 fapiPrivateGetIncome
+            params = {'symbol': market['id'], 'incomeType': 'FUNDING_FEE'}
+            if since: params['startTime'] = since
             income_history = await self.exchange.exchange.fapiPrivateGetIncome(params)
-            # --- 修正结束 ---
-
-            if income_history:
-                self.profit_tracker.add_funding_fees(income_history)
-            else:
-                self.logger.info("未发现新的资金费用记录。")
-
+            if income_history: self.profit_tracker.add_funding_fees(income_history)
+            else: self.logger.info("未发现新的资金费用记录。")
             self.last_funding_check_time = current_time
         except Exception as e:
             self.logger.error(f"同步资金费用时发生错误: {e}", exc_info=True)
 
+    async def _find_and_analyze_trendlines(self, ohlcv_data: list, current_price: float):
+        self.last_trendline_analysis = { "support_price": None, "resistance_price": None }
+        lookback = settings.TRENDLINE_LOOKBACK_PERIOD
+        window = settings.TRENDLINE_PIVOT_WINDOW
+        if len(ohlcv_data) < lookback:
+            return None, None
+        df = pd.DataFrame(ohlcv_data[-lookback:], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['is_swing_low'] = (df['low'] == df['low'].rolling(window=2*window+1, center=True, min_periods=window+1).min())
+        df['is_swing_high'] = (df['high'] == df['high'].rolling(window=2*window+1, center=True, min_periods=window+1).max())
+        swing_lows = df[df['is_swing_low']].copy()
+        swing_highs = df[df['is_swing_high']].copy()
+        support_line, resistance_line = None, None
+        if len(swing_lows) >= 2:
+            p1, p2 = swing_lows.iloc[-2], swing_lows.iloc[-1]
+            slope = (p2['low'] - p1['low']) / (p2['timestamp'] - p1['timestamp']) if (p2['timestamp'] - p1['timestamp']) != 0 else 0
+            support_line = {'p1_ts': p1['timestamp'], 'p1_price': p1['low'], 'slope': slope}
+        if len(swing_highs) >= 2:
+            p1, p2 = swing_highs.iloc[-2], swing_highs.iloc[-1]
+            slope = (p2['high'] - p1['high']) / (p2['timestamp'] - p1['timestamp']) if (p2['timestamp'] - p1['timestamp']) != 0 else 0
+            resistance_line = {'p1_ts': p1['timestamp'], 'p1_price': p1['high'], 'slope': slope}
+        current_ts = ohlcv_data[-1][0]
+        if support_line:
+            self.last_trendline_analysis['support_price'] = support_line['p1_price'] + (current_ts - support_line['p1_ts']) * support_line['slope']
+        if resistance_line:
+            self.last_trendline_analysis['resistance_price'] = resistance_line['p1_price'] + (current_ts - resistance_line['p1_ts']) * resistance_line['slope']
+        return support_line, resistance_line
 
     async def initialize(self):
-        """初始化，并根据需要从历史数据自动创建利润账本"""
         try:
             await self.exchange.load_markets()
-            
-            # --- [核心修改] 检查利润账本是否为全新，如果是，则从历史初始化 ---
-            if self.profit_tracker.is_new:
-                await self._initialize_profit_from_history()
-            
+            market_info = self.exchange.exchange.market(self.symbol)
+            self.min_trade_amount = market_info.get('limits', {}).get('amount', {}).get('min', 0.001)
+            if self.min_trade_amount is None or self.min_trade_amount == 0.0: self.min_trade_amount = 0.001
+            self.taker_fee_rate = market_info.get('taker', self.taker_fee_rate)
+            self.logger.info(f"已加载市场信息, Taker费率: {self.taker_fee_rate * 100:.4f}%, 最小交易量: {self.min_trade_amount}")
+            if self.profit_tracker.is_new: await self._initialize_profit_from_history()
             self.logger.info(f"正在为 {self.symbol} 设置杠杆为 {futures_settings.FUTURES_LEVERAGE}x...")
             await self.exchange.set_leverage(futures_settings.FUTURES_LEVERAGE, self.symbol)
             self.logger.info(f"正在为 {self.symbol} 设置保证金模式为 {futures_settings.FUTURES_MARGIN_MODE}...")
@@ -108,1046 +120,1075 @@ class FuturesTrendTrader:
             self.logger.info(f"合约趋势策略初始化成功: {self.symbol}")
             self.initialized = True
         except ExchangeError as e:
-            self.logger.warning(f"设置杠杆或保证金模式可能失败 (请手动确认): {e}")
-            self.initialized = True
+            self.logger.warning(f"设置杠杆或保证金模式可能失败: {e}"); self.initialized = True
         except Exception as e:
-            self.logger.error(f"初始化失败: {e}", exc_info=True)
-            self.initialized = False
-    async def get_bollinger_bands_data(self):
-        """[新增] 专门用于计算并返回最新的布林带上、中、下轨值"""
+            self.logger.error(f"初始化失败: {e}", exc_info=True); self.initialized = False
+
+
+    async def get_bollinger_bands_data(self, ohlcv_data: list = None, period: int = None, std_dev: float = None, check_squeeze: bool = False):
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(
-                self.symbol, 
-                timeframe=settings.BREAKOUT_TIMEFRAME, 
-                limit=settings.BREAKOUT_BBANDS_PERIOD + 5
-            )
-            if not ohlcv or len(ohlcv) < settings.BREAKOUT_BBANDS_PERIOD:
+            bb_period = period if period is not None else settings.BREAKOUT_BBANDS_PERIOD
+            bb_std_dev = std_dev if std_dev is not None else settings.BREAKOUT_BBANDS_STD_DEV
+            
+            # --- [核心修改] 根据是否需要检查挤压状态，动态确定所需数据长度 ---
+            if check_squeeze and settings.ENABLE_BBAND_SQUEEZE_FILTER:
+                required_limit = bb_period + settings.BBAND_SQUEEZE_LOOKBACK_PERIOD + 5
+            else:
+                required_limit = bb_period + 2 # 只需要足够计算BBands即可
+            
+            if ohlcv_data is None: 
+                # 注意：如果外部不提供数据，这里的timeframe可能需要根据场景调整，但目前够用
+                ohlcv_data = await self.exchange.fetch_ohlcv(self.symbol, timeframe=settings.BREAKOUT_TIMEFRAME, limit=required_limit)
+            
+            if not ohlcv_data or len(ohlcv_data) < required_limit: 
+                self.logger.warning(f"BBands计算失败：数据长度 {len(ohlcv_data)} < 要求长度 {required_limit}")
                 return None
+            
+            closes = pd.Series([c[4] for c in ohlcv_data])
+            middle_band = closes.rolling(window=bb_period).mean()
+            rolling_std = closes.rolling(window=bb_period).std()
+            upper_band = middle_band + (rolling_std * bb_std_dev)
+            lower_band = middle_band - (rolling_std * bb_std_dev)
 
-            closes = pd.Series([c[4] for c in ohlcv])
+            is_squeeze = False
+            bandwidth_value = None
+            
+            # --- [核心修改] 只有在明确要求时，才计算挤压状态 ---
+            if check_squeeze and settings.ENABLE_BBAND_SQUEEZE_FILTER:
+                bandwidth = (upper_band - lower_band) / middle_band.replace(0, 1e-9)
+                bandwidth_value = bandwidth.iloc[-2]
+                
+                if len(bandwidth.dropna()) > settings.BBAND_SQUEEZE_LOOKBACK_PERIOD:
+                    squeeze_threshold = bandwidth.iloc[-(settings.BBAND_SQUEEZE_LOOKBACK_PERIOD + 2) : -2].quantile(settings.BBAND_SQUEEZE_THRESHOLD_PERCENTILE)
+                    if not np.isnan(bandwidth_value) and not np.isnan(squeeze_threshold) and bandwidth_value < squeeze_threshold:
+                        is_squeeze = True
 
-            middle_band = closes.rolling(window=settings.BREAKOUT_BBANDS_PERIOD).mean()
-            std_dev = closes.rolling(window=settings.BREAKOUT_BBANDS_PERIOD).std()
-            upper_band = middle_band + (std_dev * settings.BREAKOUT_BBANDS_STD_DEV)
-            lower_band = middle_band - (std_dev * settings.BREAKOUT_BBANDS_STD_DEV)
-
-            # 返回最后一根完整K线的布林带值
-            return {
-                "upper": upper_band.iloc[-2],
-                "middle": middle_band.iloc[-2],
-                "lower": lower_band.iloc[-2]
-            }
-        except Exception as e:
-            self.logger.error(f"计算布林带数据时出错: {e}", exc_info=True)
+            if len(upper_band) >= 2 and not np.isnan(upper_band.iloc[-2]):
+                 return {
+                     "upper": upper_band.iloc[-2], 
+                     "middle": middle_band.iloc[-2], 
+                     "lower": lower_band.iloc[-2],
+                     "bandwidth": bandwidth_value,
+                     "is_squeeze": is_squeeze
+                 }
             return None
+        except Exception as e:
+            self.logger.error(f"计算布林带数据时出错: {e}", exc_info=True); return None
+
+
     async def _initialize_profit_from_history(self):
-        """【V3 最终手续费修正版】稳健地处理可能为None的fee对象。"""
-        self.logger.warning("利润账本文件不存在，正在尝试从交易所历史成交记录中自动初始化...")
+        self.logger.warning(f"[{self.symbol}] 利润账本文件不存在，尝试从交易所历史成交初始化...")
         try:
             trades = await self.exchange.fetch_my_trades(self.symbol, limit=1000)
             if not trades:
-                self.logger.info("未在交易所找到任何历史成交记录，利润账本将从 0 开始。")
-                self.profit_tracker.initialize_profit(0.0)
+                self.logger.info(f"[{self.symbol}] 未在交易所找到历史成交记录。")
                 return
 
-            trades.sort(key=lambda x: x['timestamp'])
+            trades.sort(key=lambda x: x.get('timestamp', 0))
+
             from collections import deque
-            buy_queue = deque([t for t in trades if t['side'] == 'buy'])
-            sell_list = [t for t in trades if t['side'] == 'sell']
-            total_pnl = 0.0
-            trades_pnl_list = []
+            open_positions = deque()
+            all_historical_trades = []
 
-            for sell_trade in sell_list:
-                # --- [核心修正] 使用更安全的方式获取手续费 ---
-                sell_fee_info = sell_trade.get('fee')
-                sell_fee = sell_fee_info.get('cost', 0.0) if sell_fee_info else 0.0
+            for trade in trades:
+                trade_side = trade.get('side')
+                trade_amount = trade.get('amount')
+                trade_price = trade.get('price')
+                trade_timestamp = trade.get('timestamp')
+                trade_fee = extract_fee(trade)
+                
+                if not all([trade_side, trade_amount > 0, trade_price > 0, trade_timestamp > 0]):
+                    continue
 
-                sell_amount_to_match = sell_trade['amount']
-                while sell_amount_to_match > 1e-9 and buy_queue:
-                    buy_trade = buy_queue[0]
-                    buy_fee_info = buy_trade.get('fee')
-                    buy_fee = buy_fee_info.get('cost', 0.0) if buy_fee_info else 0.0
+                amount_to_match = trade_amount
 
-                    matched_amount = min(sell_amount_to_match, buy_trade['amount'])
-                    gross_pnl = (sell_trade['price'] - buy_trade['price']) * matched_amount
+                while amount_to_match > 1e-9 and open_positions and open_positions[0]['side'] != trade_side:
+                    open_trade = open_positions[0]
+                    matched_amount = min(amount_to_match, open_trade['amount'])
+                    
+                    pos_side = open_trade['side']
+                    entry_price = open_trade['price']
+                    exit_price = trade_price
+                    entry_timestamp = open_trade['timestamp']
+                    exit_timestamp = trade_timestamp
 
-                    sell_fee_for_match = (sell_fee / sell_trade['amount']) * matched_amount if sell_trade['amount'] > 0 else 0
-                    original_buy_amount = next((t['amount'] for t in trades if t['id'] == buy_trade['id']), buy_trade['amount'])
-                    buy_fee_for_match = (buy_fee / original_buy_amount) * matched_amount if original_buy_amount > 0 else 0
+                    proportional_entry_fee = (open_trade.get('fee', 0.0) / open_trade['amount']) * matched_amount if open_trade.get('amount', 0) > 0 else 0
+                    proportional_exit_fee = (trade_fee / trade_amount) * matched_amount if trade_amount > 0 else 0
+                    total_fee = proportional_entry_fee + proportional_exit_fee
+                    
+                    if pos_side == 'long':
+                        net_pnl = (exit_price - entry_price) * matched_amount - total_fee
+                    else: # short
+                        net_pnl = (entry_price - exit_price) * matched_amount - total_fee
+                    
+                    trade_record = {
+                        "symbol": self.symbol, "side": pos_side, "entry_price": entry_price, 
+                        "exit_price": exit_price, "size": matched_amount, "entry_timestamp": entry_timestamp, 
+                        "exit_timestamp": exit_timestamp, "net_pnl": net_pnl, "reason": "historical_import"
+                    }
+                    all_historical_trades.append(trade_record)
 
-                    net_pnl = gross_pnl - sell_fee_for_match - buy_fee_for_match
-                    total_pnl += net_pnl
-                    trades_pnl_list.append(net_pnl)
+                    amount_to_match -= matched_amount
+                    open_trade['amount'] -= matched_amount
 
-                    sell_amount_to_match -= matched_amount
-                    buy_trade['amount'] -= matched_amount
+                    if open_trade['amount'] < 1e-9:
+                        open_positions.popleft()
 
-                    if buy_trade['amount'] < 1e-9:
-                        buy_queue.popleft()
+                if amount_to_match > 1e-9:
+                    fee_for_open = (trade_fee / trade_amount) * amount_to_match if trade_amount > 0 else 0
+                    open_positions.append({
+                        'side': trade_side, 'amount': amount_to_match, 'price': trade_price, 
+                        'timestamp': trade_timestamp, 'fee': fee_for_open
+                    })
 
-            self.logger.info(f"历史成交记录分析完成，计算出的累计净利润为: {total_pnl:.2f} USDT")
-            self.profit_tracker.initialize_profit(total_pnl, trades_pnl_list)
+            if all_historical_trades:
+                all_historical_trades.sort(key=lambda x: x.get('exit_timestamp', 0))
+                self.logger.info(f"[{self.symbol}] 历史成交分析完成，成功重建 {len(all_historical_trades)} 笔已平仓交易。")
+                for record in all_historical_trades:
+                    self.profit_tracker.record_trade(record)
+                self.logger.info(f"[{self.symbol}] 历史交易已成功导入利润账本。")
+            else:
+                self.logger.info(f"[{self.symbol}] 在历史记录中未能匹配任何完整的买卖交易对。")
+
         except Exception as e:
-            self.logger.error(f"从历史成交记录初始化利润账本时发生严重错误: {e}", exc_info=True)
-            self.logger.warning("由于初始化失败，利润账本将从 0 开始。")
-            self.profit_tracker.initialize_profit(0.0, [])
+            self.logger.error(f"[{self.symbol}] 从历史成交初始化利润账本时发生未知错误: {e}", exc_info=True)
+
     async def _update_dynamic_parameters(self):
-        """根據策略表現得分，動態調整交易參數。"""
-        if not settings.ENABLE_PERFORMANCE_FEEDBACK:
-            return
-
+        if not settings.ENABLE_PERFORMANCE_FEEDBACK: return
         score = self.profit_tracker.get_performance_score()
-        if score is None:
-            self.logger.info("交易历史不足，暂不进行动态参数调整。")
-            return
-
+        if score is None: self.logger.info("交易历史不足，暂不进行动态参数调整。"); return
         self.logger.info(f"策略综合表现得分: {score:.3f}，开始调整动态参数...")
-
-        # 線性插值函數
-        def interpolate(agg_val, def_val, s):
-            return def_val + (agg_val - def_val) * s
-
-        # 計算新的動態參數
+        def interpolate(agg, d, s): return d + (agg - d) * s
         self.dyn_pullback_zone_percent = interpolate(settings.AGGRESSIVE_PARAMS['PULLBACK_ZONE_PERCENT'], settings.DEFENSIVE_PARAMS['PULLBACK_ZONE_PERCENT'], score)
         self.dyn_atr_multiplier = interpolate(settings.AGGRESSIVE_PARAMS['ATR_MULTIPLIER'], settings.DEFENSIVE_PARAMS['ATR_MULTIPLIER'], score)
         self.dyn_pyramiding_trigger = interpolate(settings.AGGRESSIVE_PARAMS['PYRAMIDING_TRIGGER_PROFIT_MULTIPLE'], settings.DEFENSIVE_PARAMS['PYRAMIDING_TRIGGER_PROFIT_MULTIPLE'], score)
-
-        log_msg = (
-            f"动态参数已更新 (得分: {score:.3f}):\n"
-            f"  - 回调区参数: {self.dyn_pullback_zone_percent:.2f}%\n"
-            f"  - ATR止损参数: {self.dyn_atr_multiplier:.2f}\n"
-            f"  - 加仓触发倍数: {self.dyn_pyramiding_trigger:.2f}"
-        )
+        log_msg = (f"动态参数已更新 (得分: {score:.3f}):\n"
+                   f"  - 回调区参数: {self.dyn_pullback_zone_percent:.2f}%\n"
+                   f"  - ATR止损参数: {self.dyn_atr_multiplier:.2f}\n"
+                   f"  - 加仓触发倍数: {self.dyn_pyramiding_trigger:.2f}")
         self.logger.warning(log_msg)
-        send_bark_notification(log_msg, f"⚙️ {self.symbol} 策略参数自适应调整")
-    async def get_adx_data(self, period=14, ohlcv_df: pd.DataFrame = None):
-        """使用EMA平滑计算ADX (可接收外部数据)"""
+        if self.notifications_enabled:
+            send_bark_notification(log_msg, f"⚙️ {self.symbol} 策略参数自适应调整")
+
+
+    async def get_adx_data(self, period=14, ohlcv_df: pd.DataFrame = None, return_series: bool = False):
+        """
+        [V2 - 升级版] 计算ADX指标。
+        - 增加 return_series 参数，可以选择返回单个最终值或整个ADX序列。
+        - 统一并修正了计算逻辑。
+        """
         try:
             if ohlcv_df is None:
-                limit = period * 10
-                ohlcv = await self.exchange.fetch_ohlcv(self.symbol, timeframe='15m', limit=limit)
-                if not ohlcv or len(ohlcv) < period * 2:
-                    self.logger.warning("ADX计算所需K线数据不足")
-                    return None
+                ohlcv = await self.exchange.fetch_ohlcv(self.symbol, timeframe='15m', limit=period * 10)
+                if not ohlcv: return None
                 ohlcv_df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            if len(ohlcv_df) < period + 1: return None
+            
+            high = ohlcv_df['high']
+            low = ohlcv_df['low']
+            close = ohlcv_df['close']
+            
+            # 标准的TR, +DM, -DM 计算
+            move_up = high.diff()
+            move_down = low.diff().mul(-1)
+            
+            plus_dm = pd.Series(np.where((move_up > move_down) & (move_up > 0), move_up, 0), index=ohlcv_df.index)
+            minus_dm = pd.Series(np.where((move_down > move_up) & (move_down > 0), move_down, 0), index=ohlcv_df.index)
 
-            highs, lows, closes = ohlcv_df['high'].to_numpy(), ohlcv_df['low'].to_numpy(), ohlcv_df['close'].to_numpy()
-            plus_dm_list, minus_dm_list, tr_list = [], [], []
-            for i in range(1, len(highs)):
-                move_up, move_down = highs[i] - highs[i-1], lows[i-1] - lows[i]
-                plus_dm = move_up if move_up > move_down and move_up > 0 else 0
-                minus_dm = move_down if move_down > move_up and move_down > 0 else 0
-                tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-                plus_dm_list.append(plus_dm); minus_dm_list.append(minus_dm); tr_list.append(tr)
-            span = 2 * period - 1
-            smooth_plus_dm, smooth_minus_dm, smooth_tr = pd.Series(plus_dm_list).ewm(span=span, adjust=False).mean(), pd.Series(minus_dm_list).ewm(span=span, adjust=False).mean(), pd.Series(tr_list).ewm(span=span, adjust=False).mean()
-            plus_di, minus_di = (smooth_plus_dm / smooth_tr) * 100, (smooth_minus_dm / smooth_tr) * 100
-            dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1)) * 100
-            return dx.ewm(span=span, adjust=False).mean().iloc[-1]
+            tr1 = pd.DataFrame(high - low)
+            tr2 = pd.DataFrame(abs(high - close.shift(1)))
+            tr3 = pd.DataFrame(abs(low - close.shift(1)))
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+            # 使用 Wilder's Smoothing (等同于 alpha = 1/period 的 EWM)
+            atr = tr.ewm(alpha=1/period, adjust=False).mean()
+            plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, 1e-9))
+            minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, 1e-9))
+            
+            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1e-9)
+            adx = dx.ewm(alpha=1/period, adjust=False).mean()
+            
+            if adx.empty: return None
+
+            # 根据参数返回序列或单个值
+            return adx if return_series else adx.iloc[-1]
+
         except Exception as e:
-            self.logger.error(f"计算ADX失败: {e}"); return None
-
+            self.logger.error(f"计算ADX失败: {e}", exc_info=True)
+            return None
 
 
     async def _detect_trend(self, ohlcv_5m: list = None, ohlcv_15m: list = None):
-        """
-        [V2 - 修正宽限期逻辑] 双周期共振趋势判断。
-        宽限期 (Grace Period) 现在以K线为单位消耗，而不是循环次数。
-        """
         try:
-            # --- 第一部分：数据获取和初步价格趋势判断 ---
-            if ohlcv_5m is None or ohlcv_15m is None:
-                signal_tf, filter_tf = settings.TREND_SIGNAL_TIMEFRAME, settings.TREND_FILTER_TIMEFRAME
-                ohlcv_limit = max(settings.TREND_LONG_MA_PERIOD, settings.TREND_VOLUME_CONFIRM_PERIOD, settings.TREND_RSI_CONFIRM_PERIOD, settings.DYNAMIC_VOLUME_ATR_PERIOD_LONG) + 5
-                self.logger.debug("_detect_trend 正在独立获取K线数据...")
-                ohlcv_5m, ohlcv_15m = await asyncio.gather(
-                    self.exchange.fetch_ohlcv(self.symbol, timeframe=signal_tf, limit=ohlcv_limit),
-                    self.exchange.fetch_ohlcv(self.symbol, timeframe=filter_tf, limit=settings.TREND_FILTER_MA_PERIOD + 50)
-                )
-
-            if not all([ohlcv_5m, ohlcv_15m]):
-                return 'sideways'
-            
-            # [新增] 获取当前正在形成的K线的时间戳
-            current_kline_timestamp = ohlcv_5m[-1][0] if ohlcv_5m else 0
-
-            signal_df = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            signal_closes = signal_df['close'].to_numpy()
-            
-            current_price = signal_closes[-1]
-            short_ma = np.mean(signal_closes[-settings.TREND_SHORT_MA_PERIOD:])
-            long_ma = np.mean(signal_closes[-settings.TREND_LONG_MA_PERIOD:])
-            if long_ma == 0: return 'sideways'
-            diff_ratio = (short_ma - long_ma) / long_ma
-            
+            self.last_trend_analysis = { "filter_env": "N/A", "signal_trend": "N/A", "final_trend": "sideways", "confirmation": "N/A", "details": {} }
+            if ohlcv_5m is None or ohlcv_15m is None: ohlcv_5m, ohlcv_15m = await asyncio.gather(self.exchange.fetch_ohlcv(self.symbol, settings.TREND_SIGNAL_TIMEFRAME, 150), self.exchange.fetch_ohlcv(self.symbol, settings.TREND_FILTER_TIMEFRAME, 150))
+            if not all([ohlcv_5m, ohlcv_15m]): return 'sideways'
             ohlcv_15m_df = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             adx_value = await self.get_adx_data(period=14, ohlcv_df=ohlcv_15m_df)
-            
-            high_low = signal_df['high'] - signal_df['low']
-            high_close = np.abs(signal_df['high'] - signal_df['close'].shift())
-            low_close = np.abs(signal_df['low'] - signal_df['close'].shift())
-            tr = np.max(pd.concat([high_low, high_close, low_close], axis=1), axis=1)
+            self.last_trend_analysis["details"]["adx"] = f"{adx_value:.2f}" if adx_value is not None else "N/A"
+            filter_ma_series = ohlcv_15m_df['close'].ewm(span=settings.TREND_FILTER_MA_PERIOD, adjust=False).mean()
+            if len(filter_ma_series) < 10: return 'sideways'
+            filter_ma_slope = filter_ma_series.iloc[-1] - filter_ma_series.iloc[-10]
+            filter_env = 'bullish' if filter_ma_slope > 0 else 'bearish' if filter_ma_slope < 0 else 'neutral'
+            self.last_trend_analysis["filter_env"] = filter_env
+            signal_df = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            current_price = signal_df['close'].iloc[-1]
+            short_ma, long_ma = signal_df['close'].rolling(window=settings.TREND_SHORT_MA_PERIOD).mean().iloc[-1], signal_df['close'].rolling(window=settings.TREND_LONG_MA_PERIOD).mean().iloc[-1]
+            if np.isnan(short_ma) or np.isnan(long_ma) or long_ma == 0: return 'sideways'
+            diff_ratio = (short_ma - long_ma) / long_ma
+            tr = np.max(pd.concat([signal_df['high'] - signal_df['low'], np.abs(signal_df['high'] - signal_df['close'].shift()), np.abs(signal_df['low'] - signal_df['close'].shift())], axis=1), axis=1)
             atr_value = tr.ewm(span=14, adjust=False).mean().iloc[-1]
-            
-            if adx_value is None: ATR_MULTIPLIER = 1.0
-            elif adx_value > settings.TREND_ADX_THRESHOLD_STRONG: ATR_MULTIPLIER = settings.TREND_ATR_MULTIPLIER_STRONG
-            elif adx_value < settings.TREND_ADX_THRESHOLD_WEAK: ATR_MULTIPLIER = settings.TREND_ATR_MULTIPLIER_WEAK
-            else: ATR_MULTIPLIER = 1.0
-            
+            ATR_MULTIPLIER = 1.0
+            if adx_value is not None:
+                if adx_value > settings.TREND_ADX_THRESHOLD_STRONG: ATR_MULTIPLIER = settings.TREND_ATR_MULTIPLIER_STRONG
+                elif adx_value < settings.TREND_ADX_THRESHOLD_WEAK: ATR_MULTIPLIER = settings.TREND_ATR_MULTIPLIER_WEAK
             dynamic_threshold = (atr_value / current_price) * ATR_MULTIPLIER if current_price > 0 else 0
-            
-            self.logger.info(
-                f"[{self.symbol}] 5m信号判断: "
-                f"均线差值比率={diff_ratio:.6f}, "
-                f"动态阈值=±{dynamic_threshold:.6f}, "
-                f"ATR={atr_value:.4f}, "
-                f"乘数={ATR_MULTIPLIER:.2f}"
-            )
-
             signal_trend = 'sideways'
             if diff_ratio > dynamic_threshold: signal_trend = 'uptrend'
             elif diff_ratio < -dynamic_threshold: signal_trend = 'downtrend'
-
-            filter_closes = ohlcv_15m_df['close'].to_numpy()
-            filter_ma = np.mean(filter_closes[-settings.TREND_FILTER_MA_PERIOD:])
-            filter_env = 'bullish' if current_price > filter_ma else 'bearish'
-            
-            price_trend_result = 'sideways'
-            if signal_trend == 'uptrend' and filter_env == 'bullish': price_trend_result = 'uptrend'
-            elif signal_trend == 'downtrend' and filter_env == 'bearish': price_trend_result = 'downtrend'
-
-            # --- 第二部分：趋势记忆(宽限期)逻辑 ---
+            self.last_trend_analysis["signal_trend"] = signal_trend
+            ma_based_trend = 'sideways'
+            if signal_trend == 'uptrend' and (filter_env == 'bullish' or filter_env == 'neutral'): ma_based_trend = 'uptrend'
+            elif signal_trend == 'downtrend' and (filter_env == 'bearish' or filter_env == 'neutral'): ma_based_trend = 'downtrend'
+            price_trend_result = ma_based_trend
+            ranging_enabled = getattr(settings, 'ENABLE_RANGING_STRATEGY', False)
+            ranging_adx_threshold = getattr(settings, 'RANGING_ADX_THRESHOLD', 20)
+            if ranging_enabled and ma_based_trend == 'sideways':
+                if adx_value is not None and adx_value < ranging_adx_threshold:
+                    price_trend_result = 'sideways'
+                    self.logger.info(f"市场状态确认为 震荡: 均线不符且ADX({adx_value:.2f}) < 阈值({ranging_adx_threshold})。")
+                else:
+                    price_trend_result = 'uncertain'
+                    self.logger.info(f"市场状态不明确，保持观望: 均线不符，但ADX({adx_value:.2f}) >= 震荡阈值({ranging_adx_threshold})。")
             if settings.ENABLE_TREND_MEMORY:
-                # [修改] 熔断机制：如果基础趋势变化，立即终止宽限期
-                if price_trend_result != self.trend_confirmed_state or self.trend_confirmed_state == 'sideways':
-                    self.trend_grace_period_counter = 0
-                
-                # [修改] 宽限期生效逻辑
-                elif self.trend_grace_period_counter > 0:
-                    # [核心修改] 只有在新的一根K线出现时，才消耗计数器
-                    if current_kline_timestamp > self.trend_confirmation_timestamp:
+                current_kline_timestamp = ohlcv_5m[-1][0]
+                if price_trend_result == self.trend_confirmed_state:
+                    self.trend_grace_period_counter = settings.TREND_CONFIRMATION_GRACE_PERIOD
+                    self.trend_confirmation_timestamp = current_kline_timestamp
+                else:
+                    if self.trend_grace_period_counter > 0 and current_kline_timestamp > self.trend_confirmation_timestamp:
+                        price_trend_result = self.trend_confirmed_state
                         self.trend_grace_period_counter -= 1
-                        self.trend_confirmation_timestamp = current_kline_timestamp # 更新时间戳
-                        self.logger.info(f"新K线形成，宽限期剩余: {self.trend_grace_period_counter}根K线。")
-
-                    self.logger.debug(f"趋势记忆生效: 维持 [{self.trend_confirmed_state.upper()}] 判断。")
-                    
-                    self.last_trend_analysis = {
-                        "signal_trend": signal_trend, "filter_env": filter_env, "confirmation": f"In Grace({self.trend_grace_period_counter})",
-                        "diff_ratio": diff_ratio, "dynamic_threshold": dynamic_threshold, "adx_value": adx_value,
-                        "current_volume": None, "vma": None, "rsi": None, "volume_multiplier": None
-                    }
-                    return self.trend_confirmed_state
-            
-            # --- 第三部分：严格确认逻辑 ---
-            self.last_trend_analysis = {
-                "diff_ratio": diff_ratio, "dynamic_threshold": dynamic_threshold, "adx_value": adx_value,
-                "signal_trend": signal_trend, "filter_env": filter_env, "current_volume": None, "vma": None,
-                "rsi": None, "confirmation": "N/A", "volume_multiplier": None
-            }
-
-            if not self.position.is_position_open():
-                if price_trend_result == 'sideways':
-                    return 'sideways'
-                
-                confirmation_passed = True
-                is_breakout_grace_period = time.time() < self.aggressive_mode_until
-                
-                if is_breakout_grace_period:
-                    if self.aggression_level == 2:
-                        volume_multiplier = settings.SUPER_AGGRESSIVE_RELAXED_VOLUME_MULTIPLIER
-                    else:
-                        volume_multiplier = settings.AGGRESSIVE_RELAXED_VOLUME_MULTIPLIER
-                elif settings.DYNAMIC_VOLUME_ENABLED:
-                    short_atr = tr.ewm(span=settings.DYNAMIC_VOLUME_ATR_PERIOD_SHORT, adjust=False).mean().iloc[-2]
-                    long_atr = tr.ewm(span=settings.DYNAMIC_VOLUME_ATR_PERIOD_LONG, adjust=False).mean().iloc[-2]
-                    if long_atr > 0:
-                        volatility_ratio = short_atr / long_atr
-                        adjustment = (volatility_ratio - 1) * settings.DYNAMIC_VOLUME_ADJUST_FACTOR
-                        volume_multiplier = settings.DYNAMIC_VOLUME_BASE_MULTIPLIER + adjustment
-                        volume_multiplier = max(1.1, min(2.5, volume_multiplier))
-                else:
-                    volume_multiplier = settings.DYNAMIC_VOLUME_BASE_MULTIPLIER
-
-                self.last_trend_analysis['volume_multiplier'] = volume_multiplier
-
-                signal_volumes = signal_df['volume'].to_numpy()
-                if len(signal_volumes) < settings.TREND_VOLUME_CONFIRM_PERIOD + 2:
-                    self.logger.warning("成交量数据不足，跳过确认。")
-                else:
-                    last_closed_volume = signal_volumes[-2]
-                    vma = np.mean(signal_volumes[-settings.TREND_VOLUME_CONFIRM_PERIOD-2:-2])
-                    self.last_trend_analysis['current_volume'] = last_closed_volume
-                    self.last_trend_analysis['vma'] = vma
-                    if last_closed_volume < vma * volume_multiplier:
-                        confirmation_passed = False
-                        self.last_trend_analysis["confirmation"] = "Volume Failed"
-                
-                if confirmation_passed:
-                    if len(signal_closes) < settings.TREND_RSI_CONFIRM_PERIOD + 1:
-                        self.logger.warning("RSI数据不足，跳过确认。")
-                    else:
-                        delta = np.diff(signal_closes)
-                        gain, loss = np.where(delta > 0, delta, 0), np.where(delta < 0, -delta, 0)
-                        avg_gain = pd.Series(gain).ewm(alpha=1/settings.TREND_RSI_CONFIRM_PERIOD, adjust=False).mean()
-                        avg_loss = pd.Series(loss).ewm(alpha=1/settings.TREND_RSI_CONFIRM_PERIOD, adjust=False).mean()
-                        rs = avg_gain.iloc[-1] / avg_loss.iloc[-1] if avg_loss.iloc[-1] != 0 else np.inf
-                        rsi = 100 - (100 / (1 + rs))
-                        self.last_trend_analysis['rsi'] = rsi
-                        if (price_trend_result == 'uptrend' and rsi < settings.TREND_RSI_UPPER_BOUND) or \
-                           (price_trend_result == 'downtrend' and rsi > settings.TREND_RSI_LOWER_BOUND):
-                            confirmation_passed = False
-                            self.last_trend_analysis["confirmation"] = "RSI Failed"
-
-                if confirmation_passed:
-                    self.logger.info(f"趋势信号 [{price_trend_result.upper()}] 通过严格确认！启动趋势记忆。")
-                    self.last_trend_analysis["confirmation"] = "Passed"
-                    if settings.ENABLE_TREND_MEMORY:
-                        self.trend_confirmed_state = price_trend_result
-                        self.trend_grace_period_counter = settings.TREND_CONFIRMATION_GRACE_PERIOD
-                        # [新增] 记录确认时的时间戳
                         self.trend_confirmation_timestamp = current_kline_timestamp
-                    return price_trend_result
-                else:
-                    self.logger.info(f"趋势信号 [{price_trend_result.upper()}] 未通过严格确认 ({self.last_trend_analysis.get('confirmation', 'N/A')})。")
-                    if settings.ENABLE_TREND_MEMORY:
+                    else:
                         self.trend_confirmed_state = 'sideways'
-                    return 'sideways'
-            
-            self.last_trend_analysis['confirmation'] = 'N/A (In Position)'
+                        self.trend_grace_period_counter = 0
+            if not self.position.is_position_open():
+                if price_trend_result in ['sideways', 'uncertain']:
+                    self.last_trend_analysis["final_trend"] = price_trend_result
+                    return price_trend_result
+                if settings.ENABLE_TREND_MEMORY and self.trend_confirmed_state != price_trend_result:
+                    self.trend_confirmed_state = price_trend_result
+                    self.trend_grace_period_counter = settings.TREND_CONFIRMATION_GRACE_PERIOD
+                    self.trend_confirmation_timestamp = ohlcv_5m[-1][0]
+                self.last_trend_analysis["final_trend"] = price_trend_result
+                return price_trend_result
+            self.last_trend_analysis["final_trend"] = price_trend_result
             return price_trend_result
-
         except Exception as e:
             self.logger.error(f"趋势过滤器 _detect_trend 发生严重错误: {e}", exc_info=True)
             return 'sideways'
 
-    async def _check_spike_entry_signal(self):
-        """[修改] 不再直接入场，而是作为信号发射器，激活“超级激进”模式"""
-        self.last_spike_analysis = {"status": "Monitoring", "current_body": None, "body_threshold": None, "current_volume": None, "volume_threshold": None}
-        if not settings.ENABLE_SPIKE_MODIFIER or self.position.is_position_open():
-            self.last_spike_analysis["status"] = "Disabled or In Position"
-            return
-
+    async def _check_spike_entry_signal(self, ohlcv_5m: list = None, ohlcv_15m: list = None):
+        if not settings.ENABLE_SPIKE_MODIFIER or self.position.is_position_open(): return
         try:
-            ohlcv_limit = max(settings.TREND_VOLUME_CONFIRM_PERIOD, 14, settings.TREND_FILTER_MA_PERIOD) + 5
-            ohlcv = await self.exchange.fetch_ohlcv(self.symbol, timeframe=settings.SPIKE_TIMEFRAME, limit=ohlcv_limit)
-            
-            if not ohlcv or len(ohlcv) < ohlcv_limit - 2:
-                self.last_spike_analysis["status"] = "Not enough data"
-                return
-
-            current_candle = ohlcv[-1]
-            current_open, _, _, current_close, current_volume = current_candle[1], current_candle[2], current_candle[3], current_candle[4], current_candle[5]
-            
-            atr = await self.get_atr_data(period=14)
-            if atr is None: return
-            
-            current_body_size = abs(current_close - current_open)
-            body_threshold = atr * settings.SPIKE_BODY_ATR_MULTIPLIER
-            self.last_spike_analysis.update({"current_body": current_body_size, "body_threshold": body_threshold})
-            
-            if current_body_size < body_threshold:
-                self.last_spike_analysis["status"] = "Body too small"
-                return
-            
-            volumes = np.array([c[5] for c in ohlcv])
-            vma = np.mean(volumes[-settings.TREND_VOLUME_CONFIRM_PERIOD-1:-1])
+            self.last_spike_analysis = {"status": "Monitoring...","current_body": None, "body_threshold": None,"current_volume": None, "volume_threshold": None}
+            if ohlcv_5m is None: ohlcv_5m = await self.exchange.fetch_ohlcv(self.symbol, timeframe=settings.SPIKE_TIMEFRAME, limit=50)
+            if not ohlcv_5m or len(ohlcv_5m) < max(settings.TREND_VOLUME_CONFIRM_PERIOD, 14) + 2: self.last_spike_analysis["status"] = "OHLCV data insufficient"; return
+            last_closed_candle = ohlcv_5m[-2]
+            candle_timestamp, candle_open, _, _, candle_close, candle_volume = last_closed_candle
+            atr = await self.get_atr_data(period=14, ohlcv_data=ohlcv_15m)
+            current_body = abs(candle_close - candle_open)
+            body_threshold = atr * settings.SPIKE_BODY_ATR_MULTIPLIER if atr else 0
+            vma = np.mean([c[5] for c in ohlcv_5m[:-1]][-settings.TREND_VOLUME_CONFIRM_PERIOD:])
             volume_threshold = vma * settings.SPIKE_VOLUME_MULTIPLIER
-            self.last_spike_analysis.update({"current_volume": current_volume, "volume_threshold": volume_threshold})
-
-            if current_volume < volume_threshold:
-                self.last_spike_analysis["status"] = "Volume too low"
-                return
-            
-            filter_ohlcv = await self.exchange.fetch_ohlcv(self.symbol, timeframe=settings.TREND_FILTER_TIMEFRAME, limit=settings.TREND_FILTER_MA_PERIOD + 2)
-            if not filter_ohlcv or len(filter_ohlcv) < settings.TREND_FILTER_MA_PERIOD: return
-            
-            filter_closes = np.array([c[4] for c in filter_ohlcv])
-            filter_ma = np.mean(filter_closes[-settings.TREND_FILTER_MA_PERIOD:])
-            filter_env = 'bullish' if current_close > filter_ma else 'bearish'
-
-            if (current_close > current_open and filter_env == 'bullish') or \
-               (current_close < current_open and filter_env == 'bearish'):
-                
-                self.logger.warning(f"🚀 侦测到激增信号！将在接下来 {settings.SPIKE_GRACE_PERIOD_SECONDS} 秒内激活“超级激进”模式。")
-                self.aggression_level = 2
-                self.aggressive_mode_until = time.time() + settings.SPIKE_GRACE_PERIOD_SECONDS
-                self.last_spike_analysis["status"] = "Super Aggressive Mode Activated"
-                send_bark_notification(f"将在 {settings.SPIKE_GRACE_PERIOD_SECONDS}s 内寻找最激进的回调机会。", f"🚀 {self.symbol} 激增信号")
-
+            self.last_spike_analysis.update({"current_body": current_body, "body_threshold": body_threshold,"current_volume": candle_volume, "volume_threshold": volume_threshold})
+            if atr is None or current_body < body_threshold: self.last_spike_analysis["status"] = "Body too small"; return
+            if candle_volume < volume_threshold: self.last_spike_analysis["status"] = "Volume too low"; return
+            signal_direction = 'long' if candle_close > candle_open else 'short'
+            if settings.REQUIRE_FILTER_FOR_AGGRESSIVE:
+                if ohlcv_15m is None: ohlcv_15m = await self.exchange.fetch_ohlcv(self.symbol, timeframe=settings.TREND_FILTER_TIMEFRAME, limit=settings.TREND_FILTER_MA_PERIOD + 2)
+                if not ohlcv_15m or len(ohlcv_15m) < settings.TREND_FILTER_MA_PERIOD: self.last_spike_analysis["status"] = "Filter data insufficient"; return
+                filter_ma = np.mean([c[4] for c in ohlcv_15m][-settings.TREND_FILTER_MA_PERIOD:])
+                filter_env = 'bullish' if candle_close > filter_ma else 'bearish'
+                if (signal_direction == 'long' and filter_env != 'bullish') or (signal_direction == 'short' and filter_env != 'bearish'):
+                    self.logger.info(f"激增信号 ({signal_direction}) 因与15m宏观趋势 ({filter_env}) 不符而被过滤。"); self.last_spike_analysis["status"] = f"Filtered by macro trend ({filter_env})"; return
+            self.last_spike_analysis["status"] = f"Triggered! ({signal_direction})"
+            self.last_spike_timestamp = candle_timestamp
+            self.logger.warning(f"🚀 侦测到激增信号！将在 {settings.SPIKE_ENTRY_CONFIRMATION_BARS} 根K线后寻找机会。")
+            self.aggression_level, self.aggressive_mode_until = 2, time.time() + settings.SPIKE_GRACE_PERIOD_SECONDS
         except Exception as e:
-            self.logger.error(f"检查激增信号时出错: {e}", exc_info=True)
-            self.last_spike_analysis["status"] = "Error"
+            self.logger.error(f"检查激增信号时出错: {e}", exc_info=True); self.last_spike_analysis["status"] = "Error"
 
-    async def get_entry_ema(self, ohlcv_data: list = None):
-        """计算并返回用于入场判断的EMA值 (可接收外部数据)"""
+    async def get_entry_ema(self, ohlcv_data: list = None, period: int = None):
         try:
-            # 如果外部没有提供数据，则自己获取
-            if ohlcv_data is None:
-                self.logger.debug("get_entry_ema 正在独立获取K线数据...")
-                ohlcv_data = await self.exchange.fetch_ohlcv(self.symbol, timeframe=settings.TREND_SIGNAL_TIMEFRAME, limit=futures_settings.FUTURES_ENTRY_PULLBACK_EMA_PERIOD + 5)
-            
-            if not ohlcv_data or len(ohlcv_data) < futures_settings.FUTURES_ENTRY_PULLBACK_EMA_PERIOD:
-                return None
-            
-            closes = np.array([c[4] for c in ohlcv_data])
-            ema = pd.Series(closes).ewm(span=futures_settings.FUTURES_ENTRY_PULLBACK_EMA_PERIOD, adjust=False).mean().iloc[-1]
-            return ema
+            target_period = period or futures_settings.FUTURES_ENTRY_PULLBACK_EMA_PERIOD
+            if ohlcv_data is None: ohlcv_data = await self.exchange.fetch_ohlcv(self.symbol, timeframe=settings.TREND_SIGNAL_TIMEFRAME, limit=target_period + 5)
+            if not ohlcv_data or len(ohlcv_data) < target_period: return None
+            return pd.Series([c[4] for c in ohlcv_data]).ewm(span=target_period, adjust=False).mean().iloc[-1]
         except Exception as e:
-            self.logger.error(f"计算EMA失败: {e}")
-            return None
+            self.logger.error(f"计算EMA失败: {e}"); return None
 
-    
-    async def _log_status_snapshot(self, current_price: float, current_trend: str):
+    async def _log_status_snapshot(self, current_price: float, current_trend: str, filter_ma_value: [float, str] = "N/A", ohlcv_15m: list = None):
         try:
             balance_info = await self.exchange.fetch_balance({'type': 'swap'})
-            total_equity = float(balance_info['total']['USDT'])
+            total_equity = float(balance_info.get('total', {}).get('USDT', 0.0))
             pos = self.position.get_status()
             log_lines = ["----------------- 策略状态快照 -----------------"]
             
-            if pos['is_open']:
+            if pos.get('is_open'):
+                entry_reason = pos.get('entry_reason')
+                if entry_reason == 'breakout_momentum_trade': log_lines.append("交易模式: ⚡️ 突破动能 (持仓中)")
+                elif entry_reason == 'ranging_entry': log_lines.append("交易模式: ⚖️ 均值回归 (持仓中)")
+                else: log_lines.append("交易模式: 📈 趋势跟踪 (持仓中)")
+            else:
+                ranging_enabled = getattr(settings, 'ENABLE_RANGING_STRATEGY', False)
+                if ranging_enabled and current_trend == 'sideways': log_lines.append("交易模式: ⚖️ 均值回归 (等待信号)")
+                else: log_lines.append("交易模式: 📈 趋势跟踪 (等待信号)")
+
+            if isinstance(filter_ma_value, float): log_lines.append(f"宏观MA ({settings.TREND_FILTER_TIMEFRAME} | {settings.TREND_FILTER_MA_PERIOD}): {filter_ma_value:.4f}")
+            else: log_lines.append(f"宏观MA ({settings.TREND_FILTER_TIMEFRAME} | {settings.TREND_FILTER_MA_PERIOD}): {filter_ma_value}")
+            log_lines.append(f"当前价格: {current_price:.4f}")
+            
+            if pos.get('is_open'):
                 pnl = (current_price - pos['entry_price']) * pos['size'] if pos['side'] == 'long' else (pos['entry_price'] - current_price) * pos['size']
                 margin = (pos['entry_price'] * pos['size'] / futures_settings.FUTURES_LEVERAGE)
                 pnl_percent = (pnl / margin) * 100 if margin > 0 else 0
-                dist_to_sl = abs((current_price - pos['stop_loss']) / pos['stop_loss']) * 100 if pos['stop_loss'] > 0 else float('inf')
+                dist_to_sl = abs((current_price - pos['stop_loss']) / pos['stop_loss']) * 100 if pos.get('stop_loss', 0.0) > 0 else float('inf')
                 
-                # --- [核心修改开始] ---
+                pyramiding_line, take_profit_line, ranging_tp_line = "", "", ""
 
-                # 初始化加仓目标行为空
-                pyramiding_line = ""
+                if pos.get('entry_reason') == 'ranging_entry' and ohlcv_15m:
+                    bbands = await self.get_bollinger_bands_data(
+                        ohlcv_data=ohlcv_15m,
+                        period=settings.RANGING_BBANDS_PERIOD,
+                        std_dev=settings.RANGING_BBANDS_STD_DEV
+                    )
+                    if bbands and bbands.get('middle') and settings.RANGING_TAKE_PROFIT_TARGET == 'middle':
+                        tp_price = bbands['middle']
+                        dist_to_tp = abs((tp_price - current_price) / current_price) * 100 if current_price > 0 else float('inf')
+                        ranging_tp_line = f"\n  - 均值回归止盈: {tp_price:.4f} (中轨, 距离 {dist_to_tp:.2f}%)"
+
+                if futures_settings.PYRAMIDING_ENABLED and pos.get('add_count', 0) < futures_settings.PYRAMIDING_MAX_ADD_COUNT and pos.get('initial_risk_per_unit', 0) > 0 and pos.get('entries'):
+                    next_target_multiplier = self.dyn_pyramiding_trigger * (pos['add_count'] + 1)
+                    profit_target = pos['initial_risk_per_unit'] * next_target_multiplier
+                    target_price = pos['entries'][0]['price'] + profit_target if pos['side'] == 'long' else pos['entries'][0]['price'] - profit_target
+                    pyramiding_line = f"\n  - 下次加仓触发价: {target_price:.4f} ({next_target_multiplier:.2f}R)"
                 
-                # 检查加仓功能是否启用，且尚未达到最大加仓次数
-                if futures_settings.PYRAMIDING_ENABLED and pos['add_count'] < futures_settings.PYRAMIDING_MAX_ADD_COUNT:
-                    initial_risk_per_unit = pos.get('initial_risk_per_unit', 0.0)
-                    if initial_risk_per_unit > 0:
-                        # 获取最初的开仓价
-                        initial_entry_price = pos['entries'][0]['price']
-                        
-                        # 计算下一次加仓的目标乘数
-                        next_target_multiplier = self.dyn_pyramiding_trigger * (pos['add_count'] + 1)
-                        # 计算下一次加仓需要达到的盈利目标 (单位价格)
-                        profit_target = initial_risk_per_unit * next_target_multiplier
-                        
-                        target_price = 0.0
-                        if pos['side'] == 'long':
-                            target_price = initial_entry_price + profit_target
-                        else: # short
-                            target_price = initial_entry_price - profit_target
-                        
-                        # 构建要显示的文本行
-                        pyramiding_line = f"\n  - 下次加仓触发价: {target_price:.4f} ({next_target_multiplier:.2f}R)"
-
-                # --- [核心修改结束] ---
-
-                # 止盈目标行的逻辑保持不变
-                take_profit_line = ""
                 if pos.get('take_profit', 0.0) > 0:
                     dist_to_tp = abs((pos['take_profit'] - current_price) / current_price) * 100 if current_price > 0 else float('inf')
                     take_profit_line = f"\n  - 止盈目标: {pos['take_profit']:.4f} (距离 {dist_to_tp:.2f}%)"
                 
-                # 将加仓目标行和止盈目标行一起添加到最终的输出中
                 log_lines.extend([
-                    f"持仓状态: {pos['side'].upper()}ING", 
-                    f"  - 开仓均价: {pos['entry_price']:.4f}", 
-                    f"  - 持仓数量: {pos['size']:.5f}", 
+                    f"持仓状态: {pos.get('side', 'N/A').upper()}ING",
+                    f"  - 开仓均价: {pos.get('entry_price', 0.0):.4f}",
+                    f"  - 持仓数量: {pos.get('size', 0.0):.5f}",
                     f"  - 浮动盈亏: {pnl:+.2f} USDT ({pnl_percent:+.2f}%)",
-                    f"  - 追踪止损: {pos['stop_loss']:.4f} (距离 {dist_to_sl:.2f}%)" + take_profit_line + pyramiding_line
+                    f"  - 追踪止损: {pos.get('stop_loss', 0.0):.4f} (距离 {dist_to_sl:.2f}%)" + take_profit_line + pyramiding_line + ranging_tp_line
                 ])
-
-            else:
+            else: 
                 log_lines.append("持仓状态: 空仓等待信号")
-                try:
-                    ema = await self.get_entry_ema()
-                    if ema is not None:
-                        log_lines.append(f"  - 入场监控: 当前价({current_price:.4f}) vs EMA({ema:.4f})")
-                    else:
-                        log_lines.append("  - 入场监控: EMA数据获取中...")
-                except: 
-                    log_lines.append("  - 入场监控: EMA数据获取中...")
             
-            log_lines.extend([f"市场判断: {current_trend.upper()}", f"账户权益: {total_equity:.2f} USDT", "----------------------------------------------------"])
+            log_lines.append(f"市场判断: {current_trend.upper()}")
+            log_lines.append(f"账户权益: {total_equity:.2f} USDT")
+            log_lines.append("----------------------------------------------------")
             self.logger.info("\n" + "\n".join(log_lines))
         except Exception as e:
-            self.logger.warning(f"打印状态快照时出错: {e}")
+            self.logger.warning(f"打印状态快照时出错: {e}", exc_info=True)
+
+
+    async def get_rsi_data(self, period: int, ohlcv_data: list = None):
+        try:
+            if ohlcv_data is None: ohlcv_data = await self.exchange.fetch_ohlcv(self.symbol, timeframe=settings.TREND_SIGNAL_TIMEFRAME, limit=period + 50)
+            if not ohlcv_data or len(ohlcv_data) < period + 1: return None
+            df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+            loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+            rs = gain / loss.replace(0, 1e-9)
+            rsi = 100 - (100 / (1 + rs))
+            return rsi.iloc[-1]
+        except Exception as e:
+            self.logger.error(f"计算RSI失败: {e}", exc_info=True); return None
 
     async def get_atr_data(self, period=14, ohlcv_data: list = None):
-        """计算并返回ATR(平均真实波幅)值 (可接收外部数据)"""
         try:
-            # 如果外部没有提供数据，则自己获取
-            if ohlcv_data is None:
-                self.logger.debug("get_atr_data 正在独立获取K线数据...")
-                ohlcv_data = await self.exchange.fetch_ohlcv(self.symbol, timeframe='15m', limit=period + 100)
-            
-            if not ohlcv_data or len(ohlcv_data) < period:
-                self.logger.warning("ATR计算所需K线数据不足")
-                return None
-            
+            if ohlcv_data is None: ohlcv_data = await self.exchange.fetch_ohlcv(self.symbol, timeframe='15m', limit=period + 100)
+            if not ohlcv_data or len(ohlcv_data) < 2: return None
             df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            high_low = df['high'] - df['low']
-            high_close = np.abs(df['high'] - df['close'].shift())
-            low_close = np.abs(df['low'] - df['close'].shift())
-            
-            tr = np.max(pd.concat([high_low, high_close, low_close], axis=1), axis=1)
-            atr = tr.ewm(alpha=1/period, adjust=False).mean()
-            return atr.iloc[-1]
+            tr = np.max(pd.concat([df['high'] - df['low'], np.abs(df['high'] - df['close'].shift()), np.abs(df['low'] - df['close'].shift())], axis=1), axis=1)
+            return tr.ewm(span=period, adjust=False).mean().iloc[-1]
         except Exception as e:
             self.logger.error(f"计算ATR失败: {e}"); return None
-   
 
-
-    async def _update_trailing_stop(self, current_price: float):
-        """
-        [V4.1 - 修复日志] 两阶段动态止损系统。
-        - 阶段一: 使用基于当前价格的紧密ATR追踪，快速实现保本。
-        - 阶段二: 当利润达到阈值后，切换为基于波段极值的宽松吊灯止损，以捕捉大趋势。
-        """
-        if not self.position.is_position_open():
-            return
-
-        # 如果在config中禁用了此功能，则直接返回
-        if not futures_settings.CHANDELIER_EXIT_ENABLED:
-            if self.position.is_position_open(): # 仅在有仓位时提示一次
-                 self.logger.debug("两阶段动态止损系统已禁用。")
-            return
-
+    async def _update_trailing_stop(self, current_price: float, current_trend: str, ohlcv_5m: list, ohlcv_15m: list) -> bool:
+        if not self.position.is_position_open(): return False
+        now = time.time()
+        if now - self.last_trailing_stop_update_time < futures_settings.TRAILING_STOP_MIN_UPDATE_SECONDS: return False
         pos = self.position.get_status()
+        old_stop_loss = pos['stop_loss']
+        atr_15m_long = await self.get_atr_data(period=max(futures_settings.CHANDELIER_PERIOD, futures_settings.TRAILING_STOP_ATR_LONG_PERIOD), ohlcv_data=ohlcv_15m)
+        atr_5m_short = await self.get_atr_data(period=futures_settings.TRAILING_STOP_ATR_SHORT_PERIOD, ohlcv_data=ohlcv_5m)
+        if atr_15m_long is None or atr_15m_long == 0: return False
+        if atr_15m_long < current_price * futures_settings.TRAILING_STOP_VOLATILITY_PAUSE_THRESHOLD: return False
+        final_atr_multiplier, vol_ratio = self.dyn_atr_multiplier, 1.0
+        if futures_settings.ADAPTIVE_TRAILING_STOP_ENABLED and atr_5m_short is not None and atr_15m_long > 0:
+            vol_ratio = atr_5m_short / atr_15m_long
+            final_atr_multiplier = self.dyn_atr_multiplier * (1 + max(0, vol_ratio - 1) * 0.5)
+            final_atr_multiplier = min(final_atr_multiplier, self.dyn_atr_multiplier * 2)
         initial_risk_per_unit = pos.get('initial_risk_per_unit', 0.0)
-        if initial_risk_per_unit <= 0:
-            self.logger.debug("初始风险(1R)为0，跳过追踪止损。")
-            return
-
-        # --- 计算当前浮动盈利 ---
-        initial_entry_price = pos['entries'][0]['price']
-        pnl_per_unit = (current_price - initial_entry_price) if pos['side'] == 'long' else (initial_entry_price - current_price)
+        if initial_risk_per_unit <= 0: return False
+        pnl_per_unit = (current_price - pos['entries'][0]['price']) if pos['side'] == 'long' else (pos['entries'][0]['price'] - current_price)
         profit_multiple = pnl_per_unit / initial_risk_per_unit if initial_risk_per_unit > 0 else 0
-
-        # --- 检查是否满足从阶段1切换到阶段2的条件 ---
+        if pos['sl_stage'] == 1 and profit_multiple >= futures_settings.CHANDELIER_ACTIVATION_PROFIT_MULTIPLE:
+            self.position.advance_sl_stage(2); pos['sl_stage'] = 2
+        candidate_stop_loss, reason = 0.0, ""
         if pos['sl_stage'] == 1:
-            if profit_multiple >= futures_settings.CHANDELIER_ACTIVATION_PROFIT_MULTIPLE:
-                self.position.advance_sl_stage(2)
-                pos['sl_stage'] = 2 
-                send_bark_notification(
-                    f"浮动盈利已达 {profit_multiple:.2f}R，超过 {futures_settings.CHANDELIER_ACTIVATION_PROFIT_MULTIPLE}R 门槛。",
-                    f"💡 {self.symbol} 止损策略升级为吊灯模式"
-                )
-
-        # --- 根据当前阶段执行不同的止损逻辑 ---
-        new_stop_loss = 0.0
-        reason = ""
-        log_details = "" # [新增日志] 用于存储计算细节
-
-        # --- 阶段一：常规ATR追踪止损 ---
-        if pos['sl_stage'] == 1:
-            activation_threshold = initial_risk_per_unit * 1.0
-            if pnl_per_unit < activation_threshold:
-                # [新增日志] 明确告知用户为何不移动止损
-                self.logger.info(f"止损阶段 {pos['sl_stage']}: 浮盈 {pnl_per_unit:.4f} 未达到激活门槛 {activation_threshold:.4f}，暂不移动止损。")
-                return
-
-            atr = await self.get_atr_data(period=14)
-            if atr is None: return
-
-            if pos['side'] == 'long':
-                new_stop_loss = current_price - (atr * self.dyn_atr_multiplier)
-            else:
-                new_stop_loss = current_price + (atr * self.dyn_atr_multiplier)
-            
+            if profit_multiple < 1.0: return False
+            candidate_stop_loss = current_price - (atr_15m_long * final_atr_multiplier) if pos['side'] == 'long' else current_price + (atr_15m_long * final_atr_multiplier)
             reason = "ATR Trailing"
-            log_details = f"市价={current_price:.4f}, ATR={atr:.4f}, 乘数={self.dyn_atr_multiplier:.2f}"
-
-        # --- 阶段二：吊灯止损 (Chandelier Exit) ---
         elif pos['sl_stage'] == 2:
-            try:
-                atr = await self.get_atr_data(period=14)
-                ohlcv_data = await self.exchange.fetch_ohlcv(
-                    self.symbol, 
-                    timeframe='15m', 
-                    limit=futures_settings.CHANDELIER_PERIOD + 5
-                )
-                if atr is None or not ohlcv_data or len(ohlcv_data) < futures_settings.CHANDELIER_PERIOD:
-                    self.logger.warning("吊灯止损计算数据不足，跳过本次更新。")
-                    return
-                
-                df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                
-                if pos['side'] == 'long':
-                    highest_high = df['high'].rolling(window=futures_settings.CHANDELIER_PERIOD).max().iloc[-1]
-                    new_stop_loss = highest_high - (atr * futures_settings.CHANDELIER_ATR_MULTIPLIER)
-                    log_details = f"{futures_settings.CHANDELIER_PERIOD}周期最高价={highest_high:.4f}, ATR={atr:.4f}"
-                else: # short
-                    lowest_low = df['low'].rolling(window=futures_settings.CHANDELIER_PERIOD).min().iloc[-1]
-                    new_stop_loss = lowest_low + (atr * futures_settings.CHANDELIER_ATR_MULTIPLIER)
-                    log_details = f"{futures_settings.CHANDELIER_PERIOD}周期最低价={lowest_low:.4f}, ATR={atr:.4f}"
-
-                reason = "Chandelier Exit"
-
-            except Exception as e:
-                self.logger.error(f"计算吊灯止损时出错: {e}", exc_info=True)
-                return
-
-        # [新增日志] 统一打印计算过程，无论是否移动
-        self.logger.info(
-            f"止损计算 ({reason}): "
-            f"当前SL={pos['stop_loss']:.4f}, 计算SL={new_stop_loss:.4f} | "
-            f"细节: {log_details}"
-        )
-
-        # --- 最后，调用更新方法 ---
-        if new_stop_loss > 0 and reason:
-            self.position.update_stop_loss(new_stop_loss, reason=reason)
+            df = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            if pos['side'] == 'long':
+                highest_high = df['high'].rolling(window=futures_settings.CHANDELIER_PERIOD).max().iloc[-1]
+                candidate_stop_loss = highest_high - (atr_15m_long * futures_settings.CHANDELIER_ATR_MULTIPLIER)
+            else:
+                lowest_low = df['low'].rolling(window=futures_settings.CHANDELIER_PERIOD).min().iloc[-1]
+                candidate_stop_loss = lowest_low + (atr_15m_long * futures_settings.CHANDELIER_ATR_MULTIPLIER)
+            reason = "Chandelier Exit"
+        updated = self.position.update_stop_loss(candidate_stop_loss, reason=reason)
+        if updated: self.last_trailing_stop_update_time = now
+        return updated
 
 
-    async def get_bollinger_bands_data(self, ohlcv_data: list = None):
-        """计算并返回最新的布林带上、中、下轨值 (可接收外部数据)"""
+    async def _check_breakout_signal(self, ohlcv_5m: list = None, ohlcv_15m: list = None):
+        if not settings.ENABLE_BREAKOUT_MODIFIER or self.position.is_position_open(): return None
+        # --- [核心修改] 更新UI状态字典 ---
+        self.last_breakout_analysis = { "status": "Monitoring...", "squeeze_status": "N/A" }
         try:
-            # 如果外部没有提供数据，则自己获取
-            if ohlcv_data is None:
-                self.logger.debug("get_bollinger_bands_data 正在独立获取K线数据...")
-                ohlcv_data = await self.exchange.fetch_ohlcv(
-                    self.symbol, 
-                    timeframe=settings.BREAKOUT_TIMEFRAME, 
-                    limit=settings.BREAKOUT_BBANDS_PERIOD + 5
-                )
+            required_bars = max(settings.BREAKOUT_BBANDS_PERIOD, settings.BREAKOUT_VOLUME_PERIOD, settings.BREAKOUT_RSI_PERIOD) + 3
+            if ohlcv_5m is None or len(ohlcv_5m) < required_bars: 
+                self.last_breakout_analysis["status"] = "OHLCV data insufficient"; return None
+            bbands = await self.get_bollinger_bands_data(ohlcv_data=ohlcv_5m, check_squeeze=True)
+            if bbands is None: 
+                self.last_breakout_analysis["status"] = "BBands calculation failed"; return None
 
-            if not ohlcv_data or len(ohlcv_data) < settings.BREAKOUT_BBANDS_PERIOD:
-                return None
+            # --- [核心修改] 应用布林带挤压过滤器 ---
+            if settings.ENABLE_BBAND_SQUEEZE_FILTER:
+                self.last_breakout_analysis["squeeze_status"] = "Squeezed" if bbands['is_squeeze'] else "Not Squeezed"
+                if not bbands['is_squeeze']:
+                    self.last_breakout_analysis["status"] = "波动率过滤"
+                    return None # 如果没有处于挤压状态，则直接返回，不判断后续突破
+            # --- 修改结束 ---
 
-            closes = pd.Series([c[4] for c in ohlcv_data])
+            last_candle, prev_candle = ohlcv_5m[-2], ohlcv_5m[-3]
+            is_long_breakout = (last_candle[4] > bbands['upper'] and prev_candle[4] <= bbands['upper'])
+            is_short_breakout = (last_candle[4] < bbands['lower'] and prev_candle[4] >= bbands['lower'])
             
-            middle_band = closes.rolling(window=settings.BREAKOUT_BBANDS_PERIOD).mean()
-            std_dev = closes.rolling(window=settings.BREAKOUT_BBANDS_PERIOD).std()
-            upper_band = middle_band + (std_dev * settings.BREAKOUT_BBANDS_STD_DEV)
-            lower_band = middle_band - (std_dev * settings.BREAKOUT_BBANDS_STD_DEV)
+            if not is_long_breakout and not is_short_breakout: return None
+            
+            signal_direction = 'long' if is_long_breakout else 'short'
+            self.last_breakout_analysis["status"] = f"穿越信号 ({signal_direction})"
+            
+            if settings.BREAKOUT_VOLUME_CONFIRMATION:
+                df = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                volume_threshold = df['volume'].iloc[-(settings.BREAKOUT_VOLUME_PERIOD + 1):-1].mean() * settings.BREAKOUT_VOLUME_MULTIPLIER
+                self.last_breakout_analysis.update({"volume": last_candle[5], "volume_threshold": volume_threshold})
+                if last_candle[5] < volume_threshold: self.last_breakout_analysis["status"] = "成交量过滤"; return None
+            
+            if settings.BREAKOUT_RSI_CONFIRMATION:
+                rsi_value = await self.get_rsi_data(period=settings.BREAKOUT_RSI_PERIOD, ohlcv_data=ohlcv_5m)
+                self.last_breakout_analysis.update({"rsi_value": rsi_value, "rsi_threshold": settings.BREAKOUT_RSI_THRESHOLD})
+                if rsi_value is None: self.last_breakout_analysis["status"] = "RSI计算失败"; return None
+                if (signal_direction == 'long' and rsi_value <= settings.BREAKOUT_RSI_THRESHOLD) or (signal_direction == 'short' and rsi_value >= (100 - settings.BREAKOUT_RSI_THRESHOLD)): # 修正short判断
+                    self.last_breakout_analysis["status"] = "RSI动量过滤"; return None
 
-            return {
-                "upper": upper_band.iloc[-2],
-                "middle": middle_band.iloc[-2],
-                "lower": lower_band.iloc[-2]
-            }
+            if time.time() - self.last_breakout_timestamp < settings.BREAKOUT_GRACE_PERIOD_SECONDS: 
+                self.last_breakout_analysis["status"] = "冷却中"; return None
+            
+            self.last_breakout_timestamp = time.time(); self.last_breakout_analysis["status"] = f"触发成功! ({signal_direction})"
+            self.logger.warning(f"🎯 侦测到经过确认的有效突破信号 ({signal_direction})！(源于低波动挤压)")
+            return ('breakout_momentum_entry', signal_direction)
         except Exception as e:
-            self.logger.error(f"计算布林带数据时出错: {e}", exc_info=True)
-            return None
+            self.logger.error(f"检查突破信号时出错: {e}", exc_info=True); self.last_breakout_analysis["status"] = "Error"; return None
 
 
-    async def _check_breakout_signal(self):
-        """[修改] 作为信号发射器，激活“激进”模式，并使用独立的宏观方向过滤器"""
-        if not settings.ENABLE_BREAKOUT_MODIFIER or self.position.is_position_open():
-            return
+    async def _manage_breakout_momentum_stop(self, current_price: float):
+        pos = self.position.get_status()
+        self.position.update_price_mark(current_price)
+        pos = self.position.get_status()
+        new_stop_loss = 0.0
+        if pos['side'] == 'long': new_stop_loss = pos['high_water_mark'] * (1 - settings.BREAKOUT_TRAIL_STOP_PERCENT)
+        elif pos['side'] == 'short': new_stop_loss = pos['low_water_mark'] * (1 + settings.BREAKOUT_TRAIL_STOP_PERCENT)
+        if self.position.update_stop_loss(new_stop_loss, reason="Breakout Momentum Trail"):
+            self.logger.info(f"⚡️ 突破动能追踪止损已更新至: {new_stop_loss:.4f} (基于极值: {pos.get('high_water_mark') or pos.get('low_water_mark'):.4f})")
 
-        # 如果当前已经处于任何激进模式中，则不进行干预
-        if time.time() < self.aggressive_mode_until:
-            return
-
+    async def _analyze_pullback_quality(self, entry_side: str, df: pd.DataFrame) -> bool:
+        if not settings.ENABLE_PULLBACK_QUALITY_FILTER: return True
         try:
-            # 1. 获取布林带数据和价格
-            bbands = await self.get_bollinger_bands_data()
-            if bbands is None: return
-            
-            ohlcv = await self.exchange.fetch_ohlcv(self.symbol, timeframe=settings.BREAKOUT_TIMEFRAME, limit=2)
-            if not ohlcv or len(ohlcv) < 2: return
-            last_closed_price = ohlcv[-2][4] # 使用-2来明确表示是倒数第二根，即最后一根完整K线
-
-            # 2. 获取15m宏观环境作为方向过滤器
-            filter_ohlcv = await self.exchange.fetch_ohlcv(self.symbol, timeframe=settings.TREND_FILTER_TIMEFRAME, limit=settings.TREND_FILTER_MA_PERIOD + 2)
-            if not filter_ohlcv or len(filter_ohlcv) < settings.TREND_FILTER_MA_PERIOD: return
-            
-            filter_closes = np.array([c[4] for c in filter_ohlcv])
-            filter_ma = np.mean(filter_closes[-settings.TREND_FILTER_MA_PERIOD:])
-            filter_env = 'bullish' if last_closed_price > filter_ma else 'bearish'
-
-            # 3. 判断突破
-            breakout_detected = False
-            if filter_env == 'bullish' and last_closed_price > bbands['upper']:
-                breakout_detected = True
-            elif filter_env == 'bearish' and last_closed_price < bbands['lower']:
-                breakout_detected = True
-            
-            if breakout_detected:
-                self.logger.warning(f"🎯 侦测到突破信号！将在接下来 {settings.BREAKOUT_GRACE_PERIOD_SECONDS} 秒内激活“激进”模式。")
-                self.aggression_level = 1
-                self.aggressive_mode_until = time.time() + settings.BREAKOUT_GRACE_PERIOD_SECONDS
-                send_bark_notification(
-                    f"价格: {last_closed_price:.4f}，将在 {settings.BREAKOUT_GRACE_PERIOD_SECONDS}s 内放宽审查标准。",
-                    f"🎯 {self.symbol} 突破信号"
-                )
+            short_ma = df['close'].rolling(window=settings.TREND_SHORT_MA_PERIOD).mean()
+            long_ma = df['close'].rolling(window=settings.TREND_LONG_MA_PERIOD).mean()
+            if entry_side == 'long':
+                cross_indices = np.where(np.diff(np.sign(short_ma - long_ma)) > 0)[0]
+                if len(cross_indices) == 0: return True
+                trend_start_index = cross_indices[-1]
+                trend_df = df.iloc[trend_start_index:]
+                if trend_df.empty: return True
+                pullback_start_index = trend_df['high'].idxmax()
+                impulse_wave = df.iloc[trend_start_index:pullback_start_index+1]
+                pullback_wave = df.iloc[pullback_start_index+1:]
+            else:
+                cross_indices = np.where(np.diff(np.sign(short_ma - long_ma)) < 0)[0]
+                if len(cross_indices) == 0: return True
+                trend_start_index = cross_indices[-1]
+                trend_df = df.iloc[trend_start_index:]
+                if trend_df.empty: return True
+                pullback_start_index = trend_df['low'].idxmin()
+                impulse_wave = df.iloc[trend_start_index:pullback_start_index+1]
+                pullback_wave = df.iloc[pullback_start_index+1:]
+            if impulse_wave.empty or pullback_wave.empty: return True
+            avg_impulse_volume = impulse_wave['volume'].mean()
+            avg_pullback_volume = pullback_wave['volume'].mean()
+            if avg_impulse_volume > 0 and avg_pullback_volume > (avg_impulse_volume * settings.PULLBACK_MAX_VOLUME_RATIO):
+                self.logger.warning(f"回调信号被过滤：回调成交量({avg_pullback_volume:.2f})过大。")
+                return False
+            return True
         except Exception as e:
-            self.logger.error(f"检查突破信号时出错: {e}", exc_info=True)
+            self.logger.error(f"回调质量分析时出错: {e}", exc_info=True); return True
 
-    async def _check_entry_signal(self, current_trend: str, current_price: float):
-        """[修改] 回调入场，集成对不同激进等级的回调区放宽"""
-        if self.position.is_position_open() or current_trend == 'sideways':
-            return None
-        
+    async def _confirm_momentum_rebound(self, entry_side: str, ohlcv_data: list) -> bool:
+        """[V2 - UI支持版] 使用RSI确认回调结束，动能是否恢复。"""
+        if not settings.ENABLE_ENTRY_MOMENTUM_CONFIRMATION:
+            return True
+
+        self.last_momentum_analysis = {"status": "Not Active", "rsi_value": None, "is_rebounding": False}
+
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(self.symbol, timeframe=settings.TREND_SIGNAL_TIMEFRAME, limit=futures_settings.FUTURES_ENTRY_PULLBACK_EMA_PERIOD + 5)
-            if not ohlcv: return None
-            closes = np.array([c[4] for c in ohlcv])
-            ema = pd.Series(closes).ewm(span=futures_settings.FUTURES_ENTRY_PULLBACK_EMA_PERIOD, adjust=False).mean().iloc[-1]
+            required_bars = settings.ENTRY_RSI_PERIOD + settings.ENTRY_RSI_CONFIRMATION_BARS + 5
+            if len(ohlcv_data) < required_bars:
+                self.last_momentum_analysis["status"] = "Data Insufficient"
+                return False
 
-            is_aggressive_mode_active = time.time() < self.aggressive_mode_until
+            df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).ewm(alpha=1/settings.ENTRY_RSI_PERIOD, adjust=False).mean()
+            loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/settings.ENTRY_RSI_PERIOD, adjust=False).mean()
+            rs = gain / loss.replace(0, 1e-9)
+            rsi_series = 100 - (100 / (1 + rs))
             
-            pullback_zone_percent = self.dyn_pullback_zone_percent
-            mode_name = "常规"
-            if is_aggressive_mode_active:
-                if self.aggression_level == 2 and settings.ENABLE_SPIKE_MODIFIER:
-                    pullback_zone_percent *= settings.SUPER_AGGRESSIVE_PULLBACK_ZONE_MULTIPLIER
-                    mode_name = "超级激进"
-                elif self.aggression_level == 1 and settings.ENABLE_BREAKOUT_MODIFIER:
-                    pullback_zone_percent *= settings.AGGRESSIVE_PULLBACK_ZONE_MULTIPLIER
-                    mode_name = "激进"
-            
-            zone_multiplier = pullback_zone_percent / 100.0
-            upper_bound = ema * (1 + zone_multiplier)
-            lower_bound = ema * (1 - zone_multiplier)
+            if rsi_series.isnull().all() or len(rsi_series) < settings.ENTRY_RSI_CONFIRMATION_BARS:
+                self.last_momentum_analysis["status"] = "Data Insufficient"
+                return False
 
-            self.logger.info(
-                f"[调试] 回调检查 (模式: {mode_name}): 价格={current_price:.4f} | "
-                f"机会区=[{lower_bound:.4f} - {upper_bound:.4f}]"
-            )
+            last_n_rsi = rsi_series.iloc[-settings.ENTRY_RSI_CONFIRMATION_BARS:]
+            rsi_diff = last_n_rsi.diff().dropna()
+            current_rsi = last_n_rsi.iloc[-1]
+            self.last_momentum_analysis["rsi_value"] = f"{current_rsi:.2f}"
+
+            if entry_side == 'long':
+                is_rebounding = not rsi_diff.empty and all(rsi_diff > 0)
+                self.last_momentum_analysis["is_rebounding"] = is_rebounding
+                if is_rebounding:
+                    self.last_momentum_analysis["status"] = "✅ Passed"
+                    self.logger.info(f"✅ 多头动能确认: RSI({current_rsi:.2f}) 连续回升。")
+                    return True
+                else:
+                    self.last_momentum_analysis["status"] = "❌ Filtered"
+                    self.logger.info(f"动能过滤：价格虽在回调区，但RSI({current_rsi:.2f})未显示持续回升。")
+                    return False
             
+            if entry_side == 'short':
+                is_rebounding = not rsi_diff.empty and all(rsi_diff < 0)
+                self.last_momentum_analysis["is_rebounding"] = is_rebounding
+                if is_rebounding:
+                    self.last_momentum_analysis["status"] = "✅ Passed"
+                    self.logger.info(f"✅ 空头动能确认: RSI({current_rsi:.2f}) 连续回落。")
+                    return True
+                else:
+                    self.last_momentum_analysis["status"] = "❌ Filtered"
+                    self.logger.info(f"动能过滤：价格虽在回调区，但RSI({current_rsi:.2f})未显示持续回落。")
+                    return False
+            
+            return False
+        except Exception as e:
+            self.logger.error(f"检查动能反弹时出错: {e}", exc_info=True)
+            self.last_momentum_analysis["status"] = "Error"
+            return False
+
+    async def _check_entry_signal(self, current_trend: str, current_price: float, ohlcv_5m: list, ohlcv_15m: list):
+        if self.position.is_position_open() or current_trend not in ['uptrend', 'downtrend']: return None
+        try:
+            ema_fast = await self.get_entry_ema(ohlcv_data=ohlcv_5m, period=10)
+            ema_slow = await self.get_entry_ema(ohlcv_data=ohlcv_5m, period=20)
+            if ema_fast is None or ema_slow is None: return None
+            
+            upper_bound, lower_bound = (max(ema_fast, ema_slow), min(ema_fast, ema_slow))
             entry_side = None
             if current_trend == 'uptrend' and lower_bound <= current_price <= upper_bound:
-                self.logger.info(f"📈 做多入场信号: 价格({current_price:.4f})已进入回调机会区。")
                 entry_side = 'long'
             elif current_trend == 'downtrend' and lower_bound <= current_price <= upper_bound:
-                self.logger.info(f"📉 做空入场信号: 价格({current_price:.4f})已进入反弹机会区。")
                 entry_side = 'short'
-            
-            if entry_side:
-                self.aggressive_mode_until = 0
-                self.aggression_level = 0
-                return entry_side
-                
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"检查入场信号时出错: {e}", exc_info=True)
-            return None
 
+            if not entry_side:
+                return None
+            is_aggressive_mode = self.aggressive_mode_until > time.time()
+
+            if is_aggressive_mode:
+                self.logger.warning("处于激增信号后的攻击模式中，将跳过RSI动能确认，直接入场！")
+                momentum_confirmed = True
+            else:
+                self.logger.info(f"位置信号 ({entry_side}) 已触发，开始进行动能确认...")
+                momentum_confirmed = await self._confirm_momentum_rebound(entry_side, ohlcv_5m)
+
+            if not momentum_confirmed:
+                return None
+
+            df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            is_quality_pullback = await self._analyze_pullback_quality(entry_side, df_5m)
+            if not is_quality_pullback:
+                return None
+
+            if settings.ENABLE_TRENDLINE_FILTER:
+                # ... (您现有的趋势线代码逻辑) ...
+                pass
+
+            self.logger.warning(f"{'📈' if entry_side == 'long' else '📉'} 高质量入场信号: 价格({current_price:.4f})在回调区且通过所有过滤器。")
+            return entry_side
+                
+        except Exception as e:
+            self.logger.error(f"检查入场信号时出错: {e}", exc_info=True); return None
 
     async def _check_exit_signal(self, current_price: float):
-        """
-        【V3 离场优化版】
-        1. (最高优先级) 检查是否触及动态更新的追踪止损位。
-        2. (可选) 保留固定止盈作为备用。
-        3. (已移除) 不再使用敏感的趋势判断作为主要平仓依据，避免被短期波动震荡出局。
-        """
-        if not self.position.is_position_open():
-            return None # 确保计数器在空仓时被忽略
-        
+        if not self.position.is_position_open(): return None
         try:
             pos = self.position.get_status()
-            
-            # 1. 检查动态追踪止损 (最高优先级)
-            if (pos['side'] == 'long' and current_price <= pos['stop_loss']) or \
-               (pos['side'] == 'short' and current_price >= pos['stop_loss']):
-                self.logger.warning(f"🚨 追踪止损离场: {pos['side']}仓位价格({current_price:.4f})触及动态止损线({pos['stop_loss']:.4f})。")
-                return 'trailing_stop_loss'
-
-            # 2. 【核心修改】通过检查止盈价是否大于0，来决定是否执行这块逻辑。
-            # 因为我们在开仓时已经将其设为0，所以这块代码永远不会被执行，从而安全地禁用了该功能。
-            if pos.get('take_profit', 0.0) > 0:
-                if (pos['side'] == 'long' and current_price >= pos['take_profit']) or \
-                   (pos['side'] == 'short' and current_price <= pos['take_profit']):
-                    self.logger.info(f"✅ 固定止盈离场: {pos['side']}仓位价格({current_price:.4f})触及止盈线({pos['take_profit']:.4f})。")
-                    return 'take_profit'
-            
+            if (pos['side'] == 'long' and current_price <= pos['stop_loss']) or (pos['side'] == 'short' and current_price >= pos['stop_loss']): return 'trailing_stop_loss'
+            if pos.get('take_profit', 0.0) > 0 and ((pos['side'] == 'long' and current_price >= pos['take_profit']) or (pos['side'] == 'short' and current_price <= pos['take_profit'])): return 'take_profit'
             return None
-
         except Exception as e:
-            self.logger.error(f"检查出场信号时出错: {e}", exc_info=True)
-            return None
+            self.logger.error(f"检查出场信号时出错: {e}", exc_info=True); return None
 
     async def confirm_order_filled(self, order_id, timeout=60, interval=2):
-        """循环查询订单状态，直到确认成交或超时"""
         start_time = time.time()
+        filled_order_data = None
         while time.time() - start_time < timeout:
-            try:
-                order = await self.exchange.fetch_order(order_id, self.symbol)
-                if order['status'] == 'closed':
-                    self.logger.info(f"订单 {order_id} 已确认成交 (均价: {order['average']})。")
-                    return order
-                await asyncio.sleep(interval)
-            except NetworkError as e:
-                self.logger.warning(f"确认订单网络错误，重试: {e}"); await asyncio.sleep(interval * 2)
-            except Exception as e:
-                self.logger.error(f"确认订单时未知错误: {e}", exc_info=True); return None
-        return None    
+            if filled_order_data is None:
+                try:
+                    order = await self.exchange.fetch_order(order_id, self.symbol)
+                    if isinstance(order, dict) and order.get('status') == 'closed':
+                        filled_order_data = order
+                except NetworkError as e:
+                    self.logger.warning(f"确认订单网络错误，重试: {e}"); await asyncio.sleep(interval * 2)
+                except Exception as e:
+                    self.logger.error(f"确认订单 {order_id} 时发生未知错误: {e}", exc_info=True); await asyncio.sleep(interval)
+            if filled_order_data is not None: break
+            await asyncio.sleep(interval)
+        if filled_order_data: return filled_order_data
+        else: self.logger.error(f"订单 {order_id} 确认超时！"); return None
 
-
-    async def execute_trade(self, action: str, side: str = None, reason: str = ''):
-        """【修改】增加 reason 参数，用于记录开仓原因"""
+    
+    async def execute_trade(self, action: str, side: str = None, reason: str = '', size: float = None):
+        logger = self.logger
         try:
             if action == 'open' and side:
-                market = self.exchange.exchange.market(self.symbol)
                 entry_price = (await self.exchange.fetch_ticker(self.symbol))['last']
-                sl_percent = futures_settings.FUTURES_STOP_LOSS_PERCENT / 100
+                if not isinstance(entry_price, (int, float)) or entry_price <= 0: logger.error(f"获取价格无效 ({entry_price})，取消开仓。"); return
                 balance_info = await self.exchange.fetch_balance({'type': 'swap'})
-                total_equity = float(balance_info['total']['USDT'])
-                risk_amount_per_trade = total_equity * (futures_settings.FUTURES_RISK_PER_TRADE_PERCENT / 100)
-                price_diff_per_unit = entry_price * sl_percent
-                if price_diff_per_unit <= 0: self.logger.error("止损距离为0，取消开仓。"); return
+                total_equity = float(balance_info.get('total', {}).get('USDT', 0.0))
+                available_balance = float(balance_info.get('free', {}).get('USDT', 0.0)) or total_equity
+                if available_balance <= 0: logger.critical(f"账户余额为0，无法开仓。"); return
+                leverage = futures_settings.FUTURES_LEVERAGE
+                min_notional = getattr(futures_settings, 'MIN_NOMINAL_VALUE_USDT', 21.0)
+                price_diff_per_unit = 0.0
 
-                position_size_by_risk = risk_amount_per_trade / price_diff_per_unit
-                min_notional = market.get('limits', {}).get('cost', {}).get('min', 20.0)
-                min_position_size = min_notional / entry_price if entry_price > 0 else float('inf')
-                final_position_size = max(position_size_by_risk, min_position_size)
+                if reason == 'ranging_entry':
+                    ohlcv_ranging = await self.exchange.fetch_ohlcv(self.symbol, settings.RANGING_TIMEFRAME, 150)
+                    atr = await self.get_atr_data(period=14, ohlcv_data=ohlcv_ranging)
+                    if atr is None or atr <= 0: logger.error(f"无法为震荡策略获取ATR，取消开仓。"); return
+                    price_diff_per_unit = atr * settings.RANGING_STOP_LOSS_ATR_MULTIPLIER
+                elif futures_settings.USE_ATR_FOR_INITIAL_STOP:
+                    atr = await self.get_atr_data(period=14)
+                    if atr is None or atr <= 0: logger.error(f"无法获取有效ATR，取消开仓。"); return
+                    price_diff_per_unit = atr * futures_settings.INITIAL_STOP_ATR_MULTIPLIER
+                else:
+                    price_diff_per_unit = entry_price * (getattr(futures_settings, 'FUTURES_STOP_LOSS_PERCENT', 2.5) / 100)
+                
+                price_diff_per_unit = max(price_diff_per_unit, entry_price * 0.005)
+                if price_diff_per_unit <= 0: logger.error(f"止损距离计算错误({price_diff_per_unit})，取消开仓。"); return
 
-                amount_precision_float = market.get('precision', {}).get('amount')
-                if amount_precision_float is None: raise ValueError(f"无法获取 {self.symbol} 的数量精度")
-                import math
-                position_size_rounded_up = math.ceil(final_position_size / amount_precision_float) * amount_precision_float
-                position_size_formatted = self.exchange.exchange.amount_to_precision(self.symbol, position_size_rounded_up)
+                final_pos_size = 0.0
+                if reason == 'breakout_momentum_trade':
+                    nominal_value = settings.BREAKOUT_NOMINAL_VALUE_USDT
+                    final_pos_size = nominal_value / entry_price
+                    logger.info(f"应用 [突破] 策略仓位: 名义价值 ${nominal_value:.2f}")
+                elif reason == 'ranging_entry':
+                    nominal_value = settings.RANGING_NOMINAL_VALUE_USDT
+                    final_pos_size = nominal_value / entry_price
+                    logger.info(f"应用 [震荡] 策略仓位: 名义价值 ${nominal_value:.2f}")
+                else:
+                    risk_amount = total_equity * (futures_settings.FUTURES_RISK_PER_TRADE_PERCENT / 100)
+                    pos_size_by_risk = risk_amount / price_diff_per_unit
+                    logger.info(f"应用 [趋势] 策略仓位: 风险金额 ${risk_amount:.2f}, 风险计算数量 {pos_size_by_risk:.5f}")
+                    if pos_size_by_risk * entry_price < min_notional:
+                        final_pos_size = min_notional / entry_price
+                        logger.warning(f"风险计算仓位过小，使用最小名义价值 ${min_notional:.2f} 开仓。")
+                    else:
+                        final_pos_size = pos_size_by_risk
 
+                required_margin = (final_pos_size * entry_price) / leverage
+                max_allowed_margin = total_equity * futures_settings.MAX_MARGIN_PER_TRADE_RATIO
+                
+                if required_margin > max_allowed_margin:
+                    original_size = final_pos_size
+                    final_pos_size = (max_allowed_margin * leverage) / entry_price
+                    logger.warning(
+                        f"!!! 仓位自动调整 !!!\n"
+                        f"  - 计算所需保证金 ({required_margin:.2f} USDT) 超出单笔上限 ({max_allowed_margin:.2f} USDT)。\n"
+                        f"  - 将自动缩减仓位以符合保证金上限进行开仓。\n"
+                        f"  - 原始计算数量: {original_size:.8f}, 调整后数量: {final_pos_size:.8f}"
+                    )
+                
+                if final_pos_size <= 0: logger.error(f"计算仓位为0或负数({final_pos_size})，取消开仓。"); return
+                if (final_pos_size * entry_price / leverage) > available_balance: logger.critical(f"保证金不足！需要: {(final_pos_size * entry_price / leverage):.2f}, 可用: {available_balance:.2f}。"); return
+                final_pos_size = max(final_pos_size, self.min_trade_amount)
+                pos_size_fmt = self.exchange.exchange.amount_to_precision(self.symbol, final_pos_size)
+                if float(pos_size_fmt) <= 0: logger.error(f"格式化后仓位为0({pos_size_fmt})，取消开仓。"); return
+                
                 api_side = 'buy' if side == 'long' else 'sell'
-                self.logger.info(f"准备开仓: {side.upper()} | 目标名义价值 > {min_notional} USDT | 最终格式化数量: {position_size_formatted}")
-                order = await self.exchange.create_market_order(self.symbol, api_side, position_size_formatted)
-                
+                order = await self.exchange.create_market_order(self.symbol, api_side, pos_size_fmt)
                 filled_order = await self.confirm_order_filled(order['id'])
-                if not filled_order: self.logger.critical(f"开仓订单 {order['id']} 超时未确认！请手动检查！"); return
-                
-                filled_price = filled_order['average']
-                filled_size = filled_order['filled']
-                order_timestamp = filled_order['timestamp']
-                fee_info = filled_order.get('fee')
-                entry_fee = fee_info.get('cost', 0.0) if fee_info else 0.0
-                
-                stop_loss_price = filled_price * (1 - sl_percent) if side == 'long' else filled_price * (1 + sl_percent)
-                take_profit_price = 0.0
+                if not isinstance(filled_order, dict): logger.critical(f"开仓订单 {order['id']} 确认失败。"); return
+                filled_price, filled_size, ts = filled_order.get('average'), filled_order.get('filled'), filled_order.get('timestamp')
+                if not all([isinstance(v, (int, float)) and v > 0 for v in [filled_price, filled_size, ts]]): logger.error(f"成交订单字段无效: {filled_order}。"); return
+                entry_fee = extract_fee(filled_order)
+                sl_price = filled_price - price_diff_per_unit if side == 'long' else filled_price + price_diff_per_unit
+                self.position.open_position(side, filled_price, filled_size, entry_fee, sl_price, 0.0, ts, reason)
 
-                # --- [核心修改] 将入场原因传递给 PositionTracker ---
-                # 如果 reason 为空 (例如手动触发)，则给一个默认值
-                entry_reason = reason if reason else 'unknown'
-                self.position.open_position(side, filled_price, filled_size, entry_fee, stop_loss_price, take_profit_price, order_timestamp, entry_reason)
-                
-                title = f"📈 开仓 {side.upper()} {self.symbol} (原因: {entry_reason})"
-                content = f"价格: {filled_price:.4f}\n数量: {filled_size:.5f}\n手续费: {entry_fee:.4f} USDT\n初始止损: {stop_loss_price:.4f}"
-                send_bark_notification(content, title)
-
+                if self.notifications_enabled:
+                    send_bark_notification(f"价格: {filled_price:.4f}\n数量: {filled_size:.5f}\n止损: {sl_price:.4f}\n原因: {reason}", f"📈 开仓 {side.upper()} {self.symbol}")
+            
             elif action == 'close':
                 if not self.position.is_position_open(): return
-                closed_position = self.position.get_status()
-                close_side, size = ('sell' if self.position.side == 'long' else 'buy'), self.position.size
-                params = {'reduceOnly': True}
-                self.logger.info(f"准备平仓: {self.position.side.upper()} | 数量: {size:.8f} | 原因: {reason}")
-                formatted_size = self.exchange.exchange.amount_to_precision(self.symbol, size)
-                order = await self.exchange.create_market_order(self.symbol, close_side, formatted_size, params)
+                pos = self.position.get_status()
+                close_side, size_to_close = ('sell' if pos['side'] == 'long' else 'buy'), pos['size']
+                if size_to_close <= 0: return
+                fmt_size = self.exchange.exchange.amount_to_precision(self.symbol, size_to_close)
+                if float(fmt_size) <= 0: return
+                order = await self.exchange.create_market_order(self.symbol, close_side, fmt_size, {'reduceOnly': True})
                 filled_order = await self.confirm_order_filled(order['id'])
-                if not filled_order: self.logger.critical(f"平仓订单 {order['id']} 超时未确认！请手动检查！"); return
-                
-                closing_fee_info = filled_order.get('fee')
-                closing_fee = closing_fee_info.get('cost', 0.0) if closing_fee_info else 0.0
-                opening_fee = closed_position.get('entry_fee', 0.0)
-
-                gross_pnl = (filled_order['average'] - closed_position['entry_price']) * closed_position['size'] if closed_position['side'] == 'long' else (closed_position['entry_price'] - filled_order['average']) * closed_position['size']
-                net_pnl = gross_pnl - opening_fee - closing_fee
-                
-                self.profit_tracker.add_profit(net_pnl)
+                if not isinstance(filled_order, dict): logger.critical(f"平仓订单 {order['id']} 超时未确认！请手动检查！"); return
+                closing_fee = extract_fee(filled_order)
+                exit_price, entry_price, pos_size = filled_order.get('average'), pos['entry_price'], pos['size']
+                if not all([isinstance(v, (int, float)) for v in [exit_price, entry_price, pos_size]]): logger.error(f"计算平仓盈亏数据无效。"); return
+                gross_pnl = (exit_price - entry_price) * pos_size if pos['side'] == 'long' else (entry_price - exit_price) * pos_size
+                net_pnl = gross_pnl - pos['entry_fee'] - closing_fee
+                trade_record = {"symbol": self.symbol, "side": pos['side'], "entry_price": entry_price, "exit_price": exit_price, "size": pos_size, "entry_timestamp": pos['entries'][0]['timestamp'] if pos.get('entries') else 0, "exit_timestamp": filled_order.get('timestamp', 0), "net_pnl": net_pnl, "reason": reason}
+                if hasattr(self, 'profit_tracker'): self.profit_tracker.record_trade(trade_record)
                 self.position.close_position()
-                
                 pnl_str = f"+{net_pnl:.2f}" if net_pnl >= 0 else f"{net_pnl:.2f}"
-                title = f"💰 平仓 {closed_position['side'].upper()} {self.symbol} | 净利润: {pnl_str} USDT"
-                content = f"平仓原因: {reason}\n开仓价: {closed_position['entry_price']:.4f}\n平仓价: {filled_order['average']:.4f}\n总手续费: {(opening_fee + closing_fee):.4f}"
-                send_bark_notification(content, title)
 
+                if self.notifications_enabled:
+                    send_bark_notification(f"原因: {reason}\n开仓均价: {entry_price:.4f}\n平仓价: {exit_price:.4f}", f"💰 平仓 {pos['side'].upper()} | 净利: {pnl_str} USDT")
+
+            elif action == 'partial_close':
+                if not self.position.is_position_open() or size is None or size <= 0: return
+                pos = self.position.get_status()
+                close_side = 'sell' if pos['side'] == 'long' else 'buy'
+                size_to_close = min(size, pos['size'])
+                if size_to_close <= 0: return
+                fmt_size = self.exchange.exchange.amount_to_precision(self.symbol, size_to_close)
+                if float(fmt_size) <= 0: return
+                order = await self.exchange.create_market_order(self.symbol, close_side, fmt_size, {'reduceOnly': True})
+                filled_order = await self.confirm_order_filled(order['id'])
+                if not isinstance(filled_order, dict): logger.critical(f"部分平仓订单 {order['id']} 超时未确认！"); return
+                closed_size, exit_price = filled_order.get('filled'), filled_order.get('average')
+                if not all([isinstance(v, (int, float)) and v is not None and v > 0 for v in [closed_size, exit_price]]): self.position.handle_partial_close(closed_size or 0); return
+                closing_fee = extract_fee(filled_order)
+                prop_entry_fee = (pos['entry_fee'] / pos['size']) * closed_size if pos['size'] > 0 else 0.0
+                gross_pnl = (exit_price - pos['entry_price']) * closed_size if pos['side'] == 'long' else (pos['entry_price'] - exit_price) * closed_size
+                net_pnl = gross_pnl - prop_entry_fee - closing_fee
+                trade_record = {"symbol": self.symbol, "side": pos['side'], "entry_price": pos['entry_price'], "exit_price": exit_price, "size": closed_size, "entry_timestamp": pos['entries'][0]['timestamp'] if pos.get('entries') else 0, "exit_timestamp": filled_order.get('timestamp', 0), "net_pnl": net_pnl, "reason": f"Partial Close: {reason}"}
+                if hasattr(self, 'profit_tracker'): self.profit_tracker.record_trade(trade_record)
+                self.position.handle_partial_close(closed_size)
+                pnl_str = f"+{net_pnl:.2f}" if net_pnl >= 0 else f"{net_pnl:.2f}"
+
+                if self.notifications_enabled:
+                    send_bark_notification(f"原因: {reason}\n平掉数量: {fmt_size}\n本次净利: {pnl_str} USDT", f"🛡️ {self.symbol} 部分止盈")
+        
         except (InsufficientFunds, ExchangeError, Exception) as e:
-            error_type = type(e).__name__
-            self.logger.error(f"执行交易({action}, {side})时发生 {error_type} 错误: {e}", exc_info=True)
-            send_bark_notification(f"交易执行失败: {e}", f"‼️ {self.symbol} 交易错误")
+            if isinstance(e, InsufficientFunds): logger.critical(f"!!! 保证金不足 !!! 在执行({action}, {side})时发生严重错误。")
+            elif isinstance(e, ccxt.ExchangeError): logger.error(f"交易所错误 ({type(e).__name__}) 在执行({action}, {side})时: {e}")
+            else: logger.error(f"执行交易({action}, {side})时发生未知错误: {type(e).__name__}: {e}", exc_info=True)
 
+    async def _apply_defensive_stop_loss(self, current_price: float):
+        atr = await self.get_atr_data(period=14)
+        if atr:
+            pos = self.position.get_status()
+            new_stop_loss = current_price - (atr * futures_settings.TREND_EXIT_ATR_MULTIPLIER) if pos['side'] == 'long' else current_price + (atr * futures_settings.TREND_EXIT_ATR_MULTIPLIER)
+            if self.position.update_stop_loss(new_stop_loss, reason="Defensive Adjustment"):
+                self.logger.info(f"防御性止损已更新至: {new_stop_loss:.4f}")
+        else: self.logger.error("防御性止损失败：无法获取ATR数据。")
 
     async def _handle_trend_disagreement(self, current_trend: str, current_price: float):
-        """增加激增入境宽限期检查，并传递原因"""
-        if not futures_settings.TREND_EXIT_ADJUST_SL_ENABLED or not self.position.is_position_open():
+        if not futures_settings.TREND_EXIT_ADJUST_SL_ENABLED or not self.position.is_position_open(): return
+        pos = self.position.get_status()
+        initial_risk = pos.get('initial_risk_per_unit', 0.0)
+        profit_multiple = 0.0
+        if initial_risk > 0: profit_multiple = ((current_price - pos['entry_price']) if pos['side'] == 'long' else (pos['entry_price'] - current_price)) / initial_risk
+        if profit_multiple < 0: self.position.reset_partial_tp_counter(reason="利润转为负数")
+        is_disagreement = (pos['side'] == 'long' and current_trend != 'uptrend') or (pos['side'] == 'short' and current_trend != 'downtrend')
+        if is_disagreement: self.trend_exit_counter += 1
+        elif self.trend_exit_counter > 0: self.trend_exit_counter = 0; return
+        if self.trend_exit_counter >= futures_settings.TREND_EXIT_CONFIRMATION_COUNT:
+            if pos['partial_tp_counter'] < 1 and profit_multiple > 0:
+                size_to_close = pos['size'] * 0.5
+                await self.execute_trade('partial_close', size=size_to_close, reason="Trend Disagreement Partial TP")
+                self.position.increment_partial_tp_counter()
+                be_price = self.position.break_even_price
+                if be_price is not None and be_price > 0: self.position.update_stop_loss(be_price, reason="Secure after Partial TP")
+            else: await self._apply_defensive_stop_loss(current_price)
+            self.trend_exit_counter = 0
+
+
+    async def _check_ranging_signal(self, current_price: float, ohlcv_ranging: list):
+        if self.position.is_position_open(): return None
+        try:
+            # --- [核心修改] 使用传入的 ohlcv_ranging (15分钟数据) ---
+            bbands = await self.get_bollinger_bands_data(
+                ohlcv_data=ohlcv_ranging, 
+                period=settings.RANGING_BBANDS_PERIOD, 
+                std_dev=settings.RANGING_BBANDS_STD_DEV
+            )
+            # --- 修改结束 ---
+
+            if bbands is None: return None
+            entry_side = None
+            if current_price <= bbands['lower']: entry_side = 'long'
+            elif current_price >= bbands['upper']: entry_side = 'short'
+
+            if entry_side: 
+                self.logger.warning(f"⚡️ 侦测到震荡交易信号 ({settings.RANGING_TIMEFRAME}): {entry_side.upper()} @ {current_price:.4f}")
+                return entry_side
+            else: 
+                self.logger.info(f"等待震荡入场 ({settings.RANGING_TIMEFRAME}): 价格({current_price:.4f})在轨道内 ({bbands['lower']:.4f} - {bbands['upper']:.4f})。")
+                return None
+        except Exception as e:
+            self.logger.error(f"检查震荡信号时出错: {e}", exc_info=True); return None
+
+    async def _manage_ranging_position(self, current_price: float, ohlcv_ranging: list):
+        pos = self.position.get_status()
+        exit_reason = await self._check_exit_signal(current_price)
+        if exit_reason: await self.execute_trade('close', reason=f"Ranging - {exit_reason}"); return
+        
+        # --- [核心修改] 使用传入的 ohlcv_ranging (15分钟数据) ---
+        bbands = await self.get_bollinger_bands_data(
+            ohlcv_data=ohlcv_ranging, 
+            period=settings.RANGING_BBANDS_PERIOD, 
+            std_dev=settings.RANGING_BBANDS_STD_DEV
+        )
+        # --- 修改结束 ---
+
+        if bbands is None: return
+        take_profit_price = 0.0
+        if settings.RANGING_TAKE_PROFIT_TARGET == 'middle': 
+            take_profit_price = bbands['middle']
+        elif settings.RANGING_TAKE_PROFIT_TARGET == 'opposite': 
+            take_profit_price = bbands['upper'] if pos['side'] == 'long' else bbands['lower']
+            
+        if take_profit_price > 0 and ((pos['side'] == 'long' and current_price >= take_profit_price) or (pos['side'] == 'short' and current_price <= take_profit_price)):
+            self.logger.warning(f"✅ 震荡策略止盈 ({settings.RANGING_TIMEFRAME}): 价格({current_price:.4f})已达到目标({take_profit_price:.4f})。")
+            await self.execute_trade('close', reason='Ranging Take Profit')
+
+    
+    async def _check_and_execute_pyramiding(self, current_price: float, current_trend: str):
+        if not futures_settings.PYRAMIDING_ENABLED or not self.position.is_position_open(): return
+        pos = self.position.get_status()
+        if pos['add_count'] >= futures_settings.PYRAMIDING_MAX_ADD_COUNT or ((pos['side'] == 'long' and current_trend != 'uptrend') or (pos['side'] == 'short' and current_trend != 'downtrend')): return
+        initial_risk = pos.get('initial_risk_per_unit', 0.0)
+        if initial_risk == 0: return
+        pnl_per_unit = current_price - pos['entries'][0]['price'] if pos['side'] == 'long' else pos['entries'][0]['price'] - current_price
+        target_multiplier = self.dyn_pyramiding_trigger * (pos['add_count'] + 1)
+        if pnl_per_unit < initial_risk * target_multiplier: return
+        
+        add_size = self.position.entries[-1]['size'] * futures_settings.PYRAMIDING_ADD_SIZE_RATIO
+        
+        if add_size < self.min_trade_amount:
+            self.logger.warning(
+                f"计算出的加仓数量 ({add_size:.8f}) 小于最小要求 ({self.min_trade_amount:.8f})。"
+                f"将自动调整为最小允许数量进行加仓。"
+            )
+            add_size = self.min_trade_amount
+
+        formatted_size = self.exchange.exchange.amount_to_precision(self.symbol, add_size)
+        api_side = 'buy' if pos['side'] == 'long' else 'sell'
+        try:
+            order = await self.exchange.create_market_order(self.symbol, api_side, formatted_size)
+            filled = await self.confirm_order_filled(order['id'])
+            if not filled: return
+            add_fee = extract_fee(filled)
+            self.position.add_to_position(filled['average'], filled['filled'], add_fee, filled['timestamp'])
+            new_pos = self.position.get_status()
+            if new_pos['add_count'] == 2: self.position.reset_partial_tp_counter(reason="Second pyramiding add completed")
+
+            if self.notifications_enabled:
+                send_bark_notification(f"Avg Price: {new_pos['entry_price']:.4f}\nTotal Size: {new_pos['size']:.5f}", f"➕ {self.symbol} Pyramiding Add successful ({new_pos['add_count']})")
+            
+            atr = await self.get_atr_data(period=14)
+            if atr:
+                atr_sl = current_price - (atr * self.dyn_atr_multiplier) if new_pos['side'] == 'long' else current_price + (atr * self.dyn_atr_multiplier)
+                be_price = self.position.break_even_price
+                if be_price is not None and be_price > 0:
+                    final_sl = max(be_price, atr_sl) if new_pos['side'] == 'long' else min(be_price, atr_sl) if atr_sl > 0 else be_price
+                    self.position.update_stop_loss(final_sl, reason="Pyramiding Secure")
+        except Exception as e:
+            self.logger.error(f"Error during pyramiding execution: {e}", exc_info=True)
+
+
+    async def _check_reversal_danger_signal(self, ohlcv_5m: list, ohlcv_15m: list) -> bool:
+        if not futures_settings.ENABLE_REVERSAL_SIGNAL_ALERT or not self.position.is_position_open(): return False
+        try:
+            pos_side = self.position.get_status()['side']
+            last_closed_candle = ohlcv_5m[-2]
+            candle_open, _, _, candle_close, candle_volume = last_closed_candle[1:6]
+            is_adverse_candle = (pos_side == 'long' and candle_close < candle_open) or (pos_side == 'short' and candle_close > candle_open)
+            if not is_adverse_candle: return False
+            atr = await self.get_atr_data(period=14, ohlcv_data=ohlcv_15m)
+            if atr is None or atr == 0: return False
+            body_size = abs(candle_close - candle_open)
+            if body_size < atr * futures_settings.REVERSAL_ALERT_BODY_ATR_MULTIPLIER: return False
+            df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            avg_volume = df_5m['volume'].iloc[-(settings.TREND_VOLUME_CONFIRM_PERIOD + 1):-1].mean()
+            volume_threshold = avg_volume * futures_settings.REVERSAL_ALERT_VOLUME_MULTIPLE
+            if candle_volume < volume_threshold: return False
+            self.logger.critical(f"！！！持仓风险预警！！！侦测到强力反向K线 (量: {candle_volume:.0f} > {volume_threshold:.0f}, 实体: {body_size:.4f} > {atr * futures_settings.REVERSAL_ALERT_BODY_ATR_MULTIPLIER:.4f})")
+            return True
+        except Exception as e:
+            self.logger.error(f"检查危险信号时出错: {e}", exc_info=True); return False
+
+
+    async def _check_and_manage_trend_exhaustion(self, ohlcv_15m: list):
+        """[V3 - 修复版] 检查趋势是否正在衰竭，并提前将止损移动到盈亏平衡点。"""
+        self.last_exhaustion_analysis = {"status": "Monitoring", "adx_value": None, "is_falling": False}
+
+        if not futures_settings.ENABLE_EXHAUSTION_ALERT or not self.position.is_position_open():
+            self.last_exhaustion_analysis["status"] = "Not Active"
             return
 
         pos = self.position.get_status()
-
-        if pos.get('entry_reason') == 'spike_entry' and pos.get('entries'):
-            entry_timestamp = pos['entries'][0].get('timestamp', 0)
-            grace_period_ms = settings.SPIKE_ENTRY_GRACE_PERIOD_MINUTES * 60 * 1000
-            if (time.time() * 1000 - entry_timestamp) < grace_period_ms:
-                self.logger.info(f"激增信号入场宽限期内，跳过趋势不一致检查。")
-                self.trend_exit_counter = 0
-                return
-        
-        trend_is_adverse = (pos['side'] == 'long' and current_trend != 'uptrend') or \
-                           (pos['side'] == 'short' and current_trend != 'downtrend')
-
-        if trend_is_adverse:
-            self.trend_exit_counter += 1
-            self.logger.info(f"持仓方向({pos['side'].upper()})与趋势({current_trend.upper()})不符，确认计数: {self.trend_exit_counter}/{futures_settings.TREND_EXIT_CONFIRMATION_COUNT}")
-
-            if self.trend_exit_counter >= futures_settings.TREND_EXIT_CONFIRMATION_COUNT:
-                self.logger.warning(f"趋势已连续 {self.trend_exit_counter} 次与持仓方向不符，触发防御性止损！")
-                atr = await self.get_atr_data(period=14)
-                if atr is None:
-                    self.logger.warning("无法获取ATR数据，本次无法调整止损。")
-                    return
-
-                new_stop_loss = 0.0
-                if pos['side'] == 'long':
-                    new_stop_loss = current_price - (atr * futures_settings.TREND_EXIT_ATR_MULTIPLIER)
-                else:
-                    new_stop_loss = current_price + (atr * futures_settings.TREND_EXIT_ATR_MULTIPLIER)
-                
-                self.position.update_stop_loss(new_stop_loss, reason="Defensive Adjustment")
-                
-                self.trend_exit_counter = 0
-        else:
-            if self.trend_exit_counter > 0:
-                self.logger.info("趋势已恢复与持仓方向一致，重置确认计数器。")
-                self.trend_exit_counter = 0
-
-    async def _check_and_execute_pyramiding(self, current_price: float, current_trend: str):
-        """[最终版] 加仓后，智能选择“保本点”与“ATR追踪”中更优的止损位"""
-        if not futures_settings.PYRAMIDING_ENABLED or not self.position.is_position_open():
+        if pos.get('sl_stage', 1) != 1:
+            self.last_exhaustion_analysis["status"] = f"Inactive (SL Stage: {pos.get('sl_stage')})"
             return
 
-        pos_status = self.position.get_status()
-        
-        if pos_status['add_count'] >= futures_settings.PYRAMIDING_MAX_ADD_COUNT:
-            return
-
-        if (pos_status['side'] == 'long' and current_trend != 'uptrend') or \
-           (pos_status['side'] == 'short' and current_trend != 'downtrend'):
-            self.logger.info(f"加仓检查：趋势({current_trend})已不符，取消加仓。")
-            return
-
-        initial_risk_per_unit = pos_status.get('initial_risk_per_unit', 0.0)
-        if initial_risk_per_unit == 0: 
-            self.logger.warning("初始风险(1R)为0，无法计算加仓目标。")
-            return
-
-        initial_entry_price = pos_status['entries'][0]['price']
-        if pos_status['side'] == 'long':
-            unrealized_pnl_per_unit = current_price - initial_entry_price
-        else:
-            unrealized_pnl_per_unit = initial_entry_price - current_price
-        
-        next_target_multiplier = self.dyn_pyramiding_trigger * (pos_status['add_count'] + 1)
-        profit_target = initial_risk_per_unit * next_target_multiplier
-        
-        if unrealized_pnl_per_unit < profit_target:
-            return
-            
-        self.logger.info(f"✅ 满足第 {pos_status['add_count'] + 1} 次加仓条件！浮动盈利已达到目标 {next_target_multiplier:.2f}R。")
-        
-        last_entry = self.position.entries[-1]
-        last_size = last_entry['size']
-        add_size = last_size * futures_settings.PYRAMIDING_ADD_SIZE_RATIO
-        
-        formatted_add_size = self.exchange.exchange.amount_to_precision(self.symbol, add_size)
-        api_side = 'buy' if pos_status['side'] == 'long' else 'sell'
-        
         try:
-            self.logger.info(f"准备加仓: {pos_status['side'].upper()} | 数量: {formatted_add_size}")
-            order = await self.exchange.create_market_order(self.symbol, api_side, formatted_add_size)
-            filled_order = await self.confirm_order_filled(order['id'])
+            df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            if not filled_order:
-                self.logger.error("加仓订单未能确认成交，本次加仓失败。")
-                return
+            # --- [核心修复] 调用统一的、正确的ADX计算函数 ---
+            adx_series = await self.get_adx_data(
+                period=futures_settings.EXHAUSTION_ADX_PERIOD, 
+                ohlcv_df=df_15m, 
+                return_series=True
+            )
+            # --- 修复结束 ---
 
-            filled_price = filled_order['average']
-            filled_size = filled_order['filled']
-            order_timestamp = filled_order['timestamp']
-            fee_info = filled_order.get('fee')
-            entry_fee = fee_info.get('cost', 0.0) if fee_info else 0.0
+            if adx_series is None or adx_series.isnull().all(): return
+
+            current_adx = adx_series.iloc[-1]
+            self.last_exhaustion_analysis["adx_value"] = f"{current_adx:.2f}"
             
-            self.position.add_to_position(filled_price, filled_size, entry_fee, order_timestamp)
+            falling_bars = futures_settings.EXHAUSTION_ADX_FALLING_BARS
+            if len(adx_series) < falling_bars + 1: return
 
-            new_pos_status = self.position.get_status()
-            title = f"➕ {self.symbol} 浮盈加仓成功 ({new_pos_status['add_count']}/{futures_settings.PYRAMIDING_MAX_ADD_COUNT})"
-            content = (f"方向: {new_pos_status['side'].upper()}\n"
-                       f"加仓价格: {filled_price:.4f}\n"
-                       f"加仓数量: {filled_size:.5f}\n"
-                       f"--- 更新后 ---\n"
-                       f"平均成本: {new_pos_status['entry_price']:.4f}\n"
-                       f"总仓位: {new_pos_status['size']:.5f}")
-            send_bark_notification(content, title)
+            last_n_adx = adx_series.iloc[-(falling_bars + 1):]
+            adx_diff = last_n_adx.diff().dropna()
 
-            break_even_price = self.position.break_even_price
+            is_falling = not adx_diff.empty and all(adx_diff < 0)
+            is_above_threshold = last_n_adx.iloc[0] > futures_settings.EXHAUSTION_ADX_THRESHOLD
+            self.last_exhaustion_analysis["is_falling"] = is_falling
 
-            atr = await self.get_atr_data(period=14)
-            atr_stop_loss = 0.0
-            if atr is not None:
-                if new_pos_status['side'] == 'long':
-                    atr_stop_loss = current_price - (atr * self.dyn_atr_multiplier)
-                else:
-                    atr_stop_loss = current_price + (atr * self.dyn_atr_multiplier)
-
-            if new_pos_status['side'] == 'long':
-                final_stop_loss = max(break_even_price, atr_stop_loss)
-            else:
-                final_stop_loss = min(break_even_price, atr_stop_loss)
-            
-            self.logger.info(f"加仓后，比较保本点({break_even_price:.4f})与ATR止损({atr_stop_loss:.4f})，选择更优的({final_stop_loss:.4f})作为新止损。")
-            self.position.update_stop_loss(final_stop_loss, reason="Pyramiding Secure")
-
+            if is_above_threshold and is_falling:
+                self.last_exhaustion_analysis["status"] = "🔥 Triggered!"
+                self.logger.warning(f"🛡️ 趋势衰竭预警！ADX 从 {last_n_adx.iloc[0]:.2f} 连续回落。止损将移动至盈亏平衡点。")
+                be_price = self.position.break_even_price
+                if be_price > 0:
+                    updated = self.position.update_stop_loss(be_price, reason="Move SL to Breakeven")
+                    if updated:
+                        self.position.advance_sl_stage(1.5) 
         except Exception as e:
-            self.logger.error(f"执行加仓时发生错误: {e}", exc_info=True)
+            self.logger.error(f"检查趋势衰竭时出错: {e}", exc_info=True)
+            self.last_exhaustion_analysis["status"] = "Error"
+
 
     async def main_loop(self):
-        """策略主循环 (已优化信号检查顺序)"""
         if not self.initialized: await self.initialize()
         while True:
             try:
-                current_price = (await self.exchange.fetch_ticker(self.symbol))['last']
-                if not current_price:
-                    self.logger.warning("无法获取当前价格，本次循环跳过。"); await asyncio.sleep(5); continue
+                ma_requirement = max(settings.TREND_LONG_MA_PERIOD, 30) + 5
+                trendline_requirement = settings.TRENDLINE_LOOKBACK_PERIOD + 5
+                ohlcv_5m_limit = max(ma_requirement, trendline_requirement)
+                ohlcv_15m_limit = max(settings.TREND_FILTER_MA_PERIOD + 50, futures_settings.EXHAUSTION_ADX_PERIOD * 3)
                 
-                current_time = time.time()
+                ticker, ohlcv_5m, ohlcv_15m = await asyncio.gather(
+                    self.exchange.fetch_ticker(self.symbol), 
+                    self.exchange.fetch_ohlcv(self.symbol, '5m', ohlcv_5m_limit), 
+                    self.exchange.fetch_ohlcv(self.symbol, '15m', ohlcv_15m_limit)
+                )
+                current_price = ticker['last']
 
-                if current_time - self.last_perf_check_time >= settings.PERFORMANCE_CHECK_INTERVAL_HOURS * 3600:
-                    await self._update_dynamic_parameters()
-                    self.last_perf_check_time = current_time
+                if not all([current_price, ohlcv_5m, ohlcv_15m]): 
+                    await asyncio.sleep(10); continue
+
+                current_trend = await self._detect_trend(ohlcv_5m, ohlcv_15m)
 
                 if not self.position.is_position_open():
-                    entry_side = None
-                    entry_reason = None
-
-                    # --- [核心重构] 调整信号检查顺序 ---
-                    # 1. (最高优先级) 检查“激增”信号，它会设置 aggression_level = 2
-                    await self._check_spike_entry_signal()
-                    
-                    # 2. 检查“突破”信号，它会设置 aggression_level = 1. 它现在是独立的
-                    await self._check_breakout_signal()
-                    
-                    # 3. 运行慢速、可靠的趋势判断, 它会读取 aggression_level 来放宽审查
-                    current_trend = await self._detect_trend()
-                    
-                    if current_time - self.last_status_log_time >= 60:
-                        await self._log_status_snapshot(current_price, current_trend)
-                        self.last_status_log_time = current_time
-                    
-                    # 4. 最后检查“回调”信号，它会读取 aggression_level 来放宽回调区
-                    entry_side = await self._check_entry_signal(current_trend, current_price)
-                    if entry_side:
-                        if time.time() < self.aggressive_mode_until:
-                            if self.aggression_level == 2:
-                                entry_reason = 'spike_pullback'
-                            elif self.aggression_level == 1:
-                                entry_reason = 'breakout_pullback'
-                        else:
-                            entry_reason = 'pullback_entry'
-                    
-                    if entry_side: 
-                        await self.execute_trade('open', side=entry_side, reason=entry_reason)
+                    await self._check_spike_entry_signal(ohlcv_5m, ohlcv_15m)
+                    if settings.ENABLE_RANGING_STRATEGY and current_trend == 'sideways':
+                        entry_side = await self._check_ranging_signal(current_price, ohlcv_15m)
+                        if entry_side: await self.execute_trade('open', side=entry_side, reason='ranging_entry')
+                    elif current_trend in ['uptrend', 'downtrend']:
+                        trade_executed = False
+                        breakout_result = await self._check_breakout_signal(ohlcv_5m, ohlcv_15m)
+                        if isinstance(breakout_result, tuple):
+                            await self.execute_trade('open', side=breakout_result[1], reason='breakout_momentum_trade'); trade_executed = True
+                        if not trade_executed:
+                            entry_side = await self._check_entry_signal(current_trend, current_price, ohlcv_5m, ohlcv_15m)
+                            if entry_side: await self.execute_trade('open', side=entry_side, reason='pullback_entry')
                 else:
-                    # 持仓逻辑 (保持不变)
-                    current_trend = await self._detect_trend()
-                    if current_time - self.last_status_log_time >= 60:
-                        await self._log_status_snapshot(current_price, current_trend)
-                        self.last_status_log_time = current_time
+                    pos_status = self.position.get_status()
+                    is_danger_signal = await self._check_reversal_danger_signal(ohlcv_5m, ohlcv_15m)
+                    if is_danger_signal:
+                        self.logger.warning("因危险信号，立即收紧止损进入防御模式！")
+                        await self._apply_defensive_stop_loss(current_price)
                     
-                    await self._check_and_execute_pyramiding(current_price, current_trend)
-                    await self._handle_trend_disagreement(current_trend, current_price)
-                    await self._update_trailing_stop(current_price)
-                    exit_reason = await self._check_exit_signal(current_price)
-                    if exit_reason: await self.execute_trade('close', reason=exit_reason)
+                    if pos_status.get('entry_reason') == 'ranging_entry':
+                        await self._manage_ranging_position(current_price, ohlcv_15m)
+                    else:
+                        trend_for_manage = await self._detect_trend(ohlcv_5m, ohlcv_15m)
+                        await self._check_and_manage_trend_exhaustion(ohlcv_15m)
+                        if pos_status.get('entry_reason') == 'breakout_momentum_trade':
+                            await self._manage_breakout_momentum_stop(current_price)
+                        else:
+                            if not is_danger_signal:
+                                await self._check_and_execute_pyramiding(current_price, trend_for_manage)
+                            await self._handle_trend_disagreement(trend_for_manage, current_price)
+                            await self._update_trailing_stop(current_price, trend_for_manage, ohlcv_5m, ohlcv_15m)
+                        exit_reason = await self._check_exit_signal(current_price)
+                        if exit_reason: await self.execute_trade('close', reason=exit_reason)
                 
+                current_time = time.time()
+                if current_time - self.last_status_log_time >= 60:
+                    current_trend_for_log = await self._detect_trend(ohlcv_5m, ohlcv_15m)
+                    filter_ma_value = "N/A"
+                    if len(ohlcv_15m) >= settings.TREND_FILTER_MA_PERIOD:
+                        ohlcv_15m_df = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                        filter_ma_series = ohlcv_15m_df['close'].ewm(span=settings.TREND_FILTER_MA_PERIOD, adjust=False).mean()
+                        if not filter_ma_series.empty: filter_ma_value = filter_ma_series.iloc[-1]
+                    await self._log_status_snapshot(current_price, current_trend_for_log, filter_ma_value, ohlcv_15m=ohlcv_15m)
+                    self.last_status_log_time = current_time
+                
+                await self._sync_funding_fees()
                 await asyncio.sleep(10)
             except Exception as e:
-                self.logger.critical(f"主循环发生致命错误，将等待60秒后重试: {e}", exc_info=True)
+                self.logger.critical(f"主循环发生致命错误: {e}", exc_info=True)
                 await asyncio.sleep(60)
+
+
