@@ -129,8 +129,8 @@
 
 1.  克隆本仓库:
     ```bash
-    git clone https://github.com/hzy11fk/Adaptive-Trend-Bot.git
-    cd Adaptive-Trend-Bot
+    git clone https://github.com/hzy11fk/AI-Hybrid-Futures-Trader.git
+    cd AI-Hybrid-Futures-Trader
     ```
 2.  创建并激活 Python 虚拟环境 (推荐 Python 3.10+):
     ```bash
