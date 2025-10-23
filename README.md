@@ -1,210 +1,217 @@
-AI糊的币安合约量化工具，可自选币对进行合约交易。
-# 高级动态趋势追踪合约交易机器人 (Adaptive Trend Bot)
+# 异步多策略加密货币合约交易机器人
 
-这是一款专为币安(Binance)U本位合约设计的全自动量化交易机器人，旨在识别并捕捉市场趋势。它集成了一套复杂的多层风险管理系统、基于历史表现的动态参数自适应调整机制，并配备了一个用于全面监控的实时Web界面。
-其核心策略基于双时间周期共振原理，通过较长周期（如15分钟）确认宏观趋势，在较短周期（如5分钟）寻找回调机会入场。开仓后，策略通过一个智能的两阶段追踪止损系统和金字塔式浮盈加仓策略来精细化地管理头寸，力求在控制风险的同时最大化趋势行情带来的利润。
+本项目是一个基于 Python `asyncio` 和 `ccxt` 库构建的高性能、多策略的加密货币合约（U本位）自动化交易机器人。它旨在通过结合趋势跟踪、突破和均值回归等多种交易逻辑，适应不同的市场环境，实现自动化交易决策和风险管理。
 
-## 核心功能亮点
+## ✨ 项目特色
+- **多策略融合**: 集成了趋势回调、布林带突破和震荡均值回归三种核心交易策略，力求在不同市场条件下捕捉交易机会。
+- **异步高性能**: 基于 `asyncio` 构建，能够高效地并发处理多个交易对的数据获取、策略计算和订单执行。
+- **健壮的交易所交互**: 通过 `ExchangeClient` 封装 `ccxt` (包括 `ccxt.pro`)，实现了包括自动重试在内的健壮的网络通信机制。
+- **精细化风险管理**:
+    - 基于ATR动态计算初始止损。
+    - 支持动态追踪止损 (Adaptive Trailing Stop Loss) 和 吊灯止损 (Chandelier Exit)。
+    - 严格的单笔风险百分比控制。
+    - 单笔最大保证金占用比例限制，防止单次重仓风险。
+    - 当计算仓位超过保证金上限时，自动缩减仓位而不是取消交易。
+- **高级仓位管理**:
+    - 支持金字塔加仓 (Pyramiding)，在盈利时扩大优势。
+    - 当计算加仓数量小于交易所最小要求时，自动调整为最小数量进行加仓。
+    - 支持基于趋势分歧或衰竭信号的部分平仓 (Partial Take Profit)。
+- **状态持久化**: 交易仓位状态和盈亏历史会被保存到本地文件 (`data` 目录)，确保程序重启后能恢复状态。
+- **实时监控**: 内置Web服务器 (`web_server.py`)，提供可视化监控仪表盘，实时展示各交易对的K线图、持仓状态、浮动盈亏、策略信号和系统日志。
+- **模拟测试**: 提供独立的纸上交易脚本 (`paper_trader.py`)，用于在不涉及真实资金的情况下，使用实时市场数据进行前瞻性测试 (Forward Testing)，并在测试结束后生成性能报告。
+- **通知系统**: 集成 Bark App 通知，实时推送开仓、平仓、加仓、参数调整等关键事件（可在模拟测试中禁用）。
 
--   **双周期共振趋势判断**: 结合快周期（5m）的交易信号与慢周期（15m）的趋势过滤，确保交易方向与市场主旋律一致，提高胜率。
--   **多维度信号确认机制**: 运用成交量(Volume)、相对强弱指数(RSI)和平均动向指数(ADX)对趋势信号进行严格验证，有效过滤掉虚假信号和弱势趋势。
--   **智能两阶段动态止损系统**:
-    * **第一阶段 (风险规避)**: 开仓初期，采用基于当前价格的紧密ATR追踪止损，目标是快速将止损位推过成本价，实现头寸的“零风险”保护。
-    * **第二阶段 (利润最大化)**: 当浮动盈利达到预设阈值（如2R）后，止损模式自动**升级**为更宽松的**吊灯止损 (Chandelier Exit)**。这种模式能容忍趋势中的正常回调，避免被市场噪音“洗出局”，从而有更大机会捕捉完整的主升浪或主跌浪。
--   **利润驱动的金字塔加仓**: 当持仓盈利达到初始风险（1R）的整数倍时，策略会自动加仓，以“倒金字塔”模式（每次加仓量递减）在正确的方向上增加头寸，实现利润的指数级增长。
--   **多信号激进模式**:
-    * **突破侦测**: 通过布林带（Bollinger Bands）实时监控价格，一旦发生突破，策略将临时进入“激进模式”，放宽入场审查标准以抓住爆发性行情。
-    * **激增侦测**: 监控K线实体和成交量的突然放大，一旦侦测到“激增”信号，将激活“超级激进模式”，以最快的速度寻找回调入场机会。
--   **基于表现的自我进化**: 策略会周期性地评估自身的交易表现（胜率、盈亏比、最大回撤），并根据得分动态调整核心参数（如回调区宽度、ATR乘数等），在“激进型”和“防御型”两种风格之间自适应切换。
--   **强大的实时Web监控仪表盘**: 内置一个基于`aiohttp`的异步Web服务器，提供：
-    * 带有持仓线、止损线和信号指标的实时K线图表。
-    * 每个交易对的详细状态面板，包括趋势分析、信号数据和业绩指标。
-    * 全局账户权益、已实现盈亏的实时追踪。
-    * 系统运行日志的实时滚动输出。
--   **稳健的状态与利润追踪**: 所有的持仓状态和交易利润都以`.json`格式持久化存储在硬盘上，即使程序重启也能恢复之前的状态，确保数据不丢失。
--   **实时交易通知**: 通过Bark应用，将所有关键交易事件（开仓、平仓、加仓、止损更新等）实时推送到您的移动设备。
+## 📈 交易策略简介
+系统会根据对市场状态的判断 (`_detect_trend` 函数)，自动选择或倾向于执行以下策略之一：
 
-## 文件结构与作用
+### 趋势回调跟踪 (Trend Following - Pullback Entry) (`pullback_entry`)
+- **核心思想**: 顺势而为，回调入场。
+- **流程**:
+    1. 通过比较5分钟快线EMA和慢线EMA，以及15分钟长期均线和ADX指标，判断主趋势方向 (上涨/下跌)。
+    2. 等待价格回调至5分钟EMA形成的“价值区域”。
+    3. 通过RSI指标确认动能是否在回调区恢复。
+    4. 分析回调成交量是否萎缩，过滤掉潜在的反转风险。
+    5. 满足所有条件后，以固定风险百分比计算仓位大小入场。
+- **图标**: 📈
 
-项目采用模块化设计，每个文件各司其职，结构清晰。
+### 布林带突破 (Bollinger Band Breakout) (`breakout_momentum_trade`)
+- **核心思想**: 捕捉由低波动转为高波动的趋势启动点。
+- **流程**:
+    1. 监控5分钟K线价格是否从布林带内部穿越到外部。
+    2. **波动率过滤 (Squeeze Filter)**: 要求突破必须发生在布林带宽度处于历史低位（挤压状态）之后。
+    3. **成交量确认**: 突破K线的成交量需显著放大。
+    4. **RSI动量确认**: RSI值需支持突破方向。
+    5. 满足所有条件后，以固定名义价值计算仓位大小入场。
+- **图标**: ⚡️
 
-| 文件                  | 作用                                                                                                                        |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `main.py`             | **程序启动入口 (The Ignition Key)**: 整个机器人的总启动脚本，负责初始化所有模块并启动主事件循环。                                 |
-| `futures_trader.py`   | **策略大脑 (The Strategy Brain)**: 包含交易策略的核心逻辑，负责决策、执行和管理所有交易行为。                                   |
-| `exchange_client.py`  | **交易所通信官 (The Exchange Communicator)**: 封装了所有与币安交易所的API交互（获取数据、下单等），为策略提供统一接口。           |
-| `position_tracker.py` | **仓位记账员 (The Position Accountant)**: 实时跟踪和管理每个交易对的持仓状态，包括成本、数量、止损阶段等。                      |
-| `profit_tracker.py`   | **业绩分析师 (The Performance Analyst)**: 记录每一笔已平仓交易的盈亏，并计算胜率、盈亏比、最大回撤等关键性能指标（KPIs）。      |
-| `web_server.py`       | **监控仪表盘 (The Monitoring UI)**: 运行一个`aiohttp` Web服务器，提供实时监控前端页面。                                         |
-| `config.py`           | **中央控制面板 (The Control Panel)**: 集中管理所有策略参数、API密钥加载逻辑和功能开关。                                         |
-| `helpers.py`          | **辅助工具箱 (The Utility Toolkit)**: 包含辅助函数，主要用于设置日志系统和发送Bark通知。                                        |
-| `.env`                | **密码保险箱 (The Vault)**: 用于存放敏感信息，如API密钥和Bark URL。                                      |
+### 震荡均值回归 (Mean Reversion - Ranging) (`ranging_entry`)
+- **核心思想**: 在市场横盘震荡时，利用价格围绕价值中枢波动的特性，进行高抛低吸。
+- **流程**:
+    1. 首先确认市场处于震荡状态 (通过 `_detect_trend` 函数判断为 `sideways`)。
+    2. 监控15分钟K线价格是否触及或穿过布林带上轨（做空）或下轨（做多）。
+    3. 触及轨道后立即入场。
+    4. 止损基于15分钟ATR动态设置。
+    5. 止盈目标通常为布林带中轨。
+    6. 以固定名义价值计算仓位大小入场。
+- **图标**: ⚖️
 
-## 快速上手指南
+## ⚙️ 功能描述
+- **交易所客户端 (`exchange_client.py`)**: 封装了与交易所API的交互，增加了针对网络错误、超时等的自动重试逻辑，提高了稳定性。
+- **主交易逻辑 (`futures_trader.py`)**: 包含了所有策略判断、订单执行、风险管理和仓位管理的核心代码。
+- **仓位追踪器 (`position_tracker.py`)**: 负责精确记录每个交易对的持仓状态（方向、均价、数量、止損、止盈、加仓次数等），并将状态持久化到本地JSON文件。
+- **利润追踪器 (`profit_tracker.py`)**: 记录每一笔已完成交易的详细信息（盈亏、手续费等），计算胜率、盈亏比等性能指标，并将历史记录持久化。
+- **Web服务器 (`web_server.py`)**: 使用 `aiohttp` 构建，提供Web界面，通过API从运行中的交易员实例获取数据并展示。
+- **模拟交易器 (`paper_trader.py`)**: 继承 `FuturesTrendTrader` 的策略逻辑，但重写了交易执行和初始化部分，将其导向一个内存中的模拟交易所 (`MockExchange`)，用于前瞻性测试。测试结束后会打印性能报告。
+- **配置文件 (`config.py`)**: 使用 `pydantic-settings` 管理所有可配置参数，支持从 `.env` 文件加载敏感信息（如API密钥）。
+- **辅助工具 (`helpers.py`)**: 包含日志设置、Bark通知发送、手续费计算等通用函数。
+- **主入口 (`main2.py`)**: 负责初始化交易所连接、创建各交易对的 `FuturesTrendTrader` 实例、启动Web服务器和所有交易员的主循环。
 
-请遵循以下步骤来配置和运行您的交易机器人。
+## 🔧 配置项详解 (config.py)
+配置文件分为 `Settings` (全局和通用策略设置) 和 `FuturesSettings` (合约交易特定设置) 两部分。
 
+### `Settings` (全局与通用策略设置)
+
+| 参数名 | 中文注释和功能说明 |
+| :--- | :--- |
+| **全局与环境设置** | |
+| `USE_TESTNET` | **是否使用测试网**: `True` 使用币安测试网环境，`False` 使用实盘环境。 |
+| `FUTURES_SYMBOLS_LIST` | **交易对列表**: 您希望机器人运行的合约列表。格式: `["BNB/USDT:USDT", "ETH/USDT:USDT"]`。 |
+| `FUTURES_INITIAL_PRINCIPAL` | **初始本金**: 用于纸上交易 (`paper_trader.py`) 的起始资金，也用于Web UI计算总盈亏率。 |
+| `BINANCE_API_KEY` | **API Key**: 您的币安主网 API Key。**强烈建议存储在 `.env` 文件中**。 |
+| `BINANCE_SECRET_KEY` | **Secret Key**: 您的币安主网 Secret Key。**强烈建议存储在 `.env` 文件中**。 |
+| `BINANCE_TESTNET_API_KEY` | **测试网 API Key**: 您的币安测试网 API Key。**强烈建议存储在 `.env` 文件中**。 |
+| `BINANCE_TESTNET_SECRET_KEY` | **测试网 Secret Key**: 您的币安测试网 Secret Key。**强烈建议存储在 `.env` 文件中**。 |
+| `BARK_URL_KEY` | **Bark 通知密钥**: 您的 Bark App 推送 URL。**强烈建议存储在 `.env` 文件中**。 |
+| **主策略：趋势跟踪与回调** | |
+| `TREND_SIGNAL_TIMEFRAME` | **信号时间周期**: 用于生成交易信号的K线周期，默认为 `'5m'`。 |
+| `TREND_FILTER_TIMEFRAME` | **过滤时间周期**: 用于判断宏观大趋势的K线周期，默认为 `'15m'`。 |
+| `TREND_SHORT_MA_PERIOD` | **短期EMA周期**: 在信号周期上计算的短期EMA均线周期，用于构成金叉/死叉信号。 |
+| `TREND_LONG_MA_PERIOD` | **长期EMA周期**: 在信号周期上计算的长期EMA均线周期，回调的“价值区域”由快慢线构成。 |
+| `TREND_FILTER_MA_PERIOD` | **宏观过滤均线周期**: 在过滤时间周期上计算的均线，用于确认大方向。 |
+| `TREND_ADX_THRESHOLD_STRONG` | **强趋势ADX阈值**: ADX高于此值时，认为趋势强劲，会使用更积极的参数。 |
+| `TREND_ADX_THRESHOLD_WEAK` | **弱趋势ADX阈值**: ADX低于此值时，认为趋势较弱，会使用更保守的参数。 |
+| `ENABLE_PULLBACK_QUALITY_FILTER` | **启用回调质量过滤器**: `True` 会分析回调浪的成交量，若成交量过大则过滤信号。 |
+| `PULLBACK_MAX_VOLUME_RATIO` | **回调成交量比例**: 若回调浪的平均成交量超过主升/跌浪的该比例，则认为回调力度过强，可能为反转。 |
+| `ENABLE_ENTRY_MOMENTUM_CONFIRMATION` | **启用入场动能确认**: `True` 会在价格进入回调区后，使用RSI指标确认动能是否恢复。 |
+| `ENTRY_RSI_PERIOD` | **RSI动能确认周期**: 用于动能确认的RSI指标计算周期。 |
+| `ENTRY_RSI_CONFIRMATION_BARS` | **RSI动能确认K线数**: RSI需要连续多少根K线回升(做多)或回落(做空)才算确认信号。 |
+| **子策略：波动率突破** | |
+| `ENABLE_BREAKOUT_MODIFIER` | **启用突破策略**: `True` 激活基于布林带挤压后的突破策略。 |
+| `BREAKOUT_NOMINAL_VALUE_USDT` | **突破策略开仓名义价值**: 突破策略采用固定名义价值（USDT）来计算开仓数量。 |
+| `BREAKOUT_TIMEFRAME` | **突破策略时间周期**: 用于判断突破信号的K线周期，建议 `'3m'` 或 `'5m'`。 |
+| `BREAKOUT_BBANDS_PERIOD` | **突破策略布林带周期**: 布林带指标的计算周期。 |
+| `BREAKOUT_BBANDS_STD_DEV` | **突破策略布林带标准差**: 布林带的标准差倍数。 |
+| `ENABLE_BBAND_SQUEEZE_FILTER` | **启用布林带挤压过滤器**: `True` 要求突破必须发生在布林带收缩（低波动）之后，是此策略的关键。 |
+| `BBAND_SQUEEZE_LOOKBACK_PERIOD` | **挤压状态回看周期**: 用于判断当前布林带宽度是否处于历史低位的回看K线数量。 |
+| `BBAND_SQUEEZE_THRESHOLD_PERCENTILE` | **挤压状态阈值百分位**: 布林带宽度小于过去N周期中的该百分位数时，视为“挤压”状态。 |
+| `BREAKOUT_VOLUME_CONFIRMATION` | **启用突破成交量确认**: `True` 要求突破K线的成交量必须显著放大。 |
+| `BREAKOUT_VOLUME_MULTIPLIER` | **突破成交量乘数**: 突破K线成交量需要超过过去平均成交量的倍数。 |
+| `BREAKOUT_RSI_CONFIRMATION` | **启用突破RSI动量确认**: `True` 要求突破时的RSI值支持突破方向。 |
+| `BREAKOUT_RSI_THRESHOLD`| **突破RSI阈值**: 多头突破时RSI需大于此值，空头突破时RSI需小于(100 - 此值)。 |
+| `BREAKOUT_GRACE_PERIOD_SECONDS` | **突破信号冷却时间**: 两次突破信号之间需要的最小间隔时间（秒）。 |
+| **子策略：震荡均值回归** | |
+| `ENABLE_RANGING_STRATEGY`| **启用震荡策略**: `True` 在趋势判断为`sideways`时，激活基于布林带轨道的反向交易策略。 |
+| `RANGING_TIMEFRAME` | **震荡策略时间周期**: 用于执行震荡策略的K线周期，建议使用较长周期如 `'15m'`。 |
+| `RANGING_NOMINAL_VALUE_USDT`| **震荡策略开仓名义价值**: 震荡策略采用固定名义价值（USDT）来计算开仓数量。 |
+| `RANGING_ADX_THRESHOLD` | **震荡ADX阈值**: 当ADX低于此值时，是激活震荡策略的条件之一。 |
+| `RANGING_BBANDS_PERIOD` | **震荡策略布林带周期**: 震荡策略所用布林带的计算周期。 |
+| `RANGING_BBANDS_STD_DEV` | **震荡策略布林带标准差**: 震荡策略所用布林带的标准差倍数。 |
+| `RANGING_TAKE_PROFIT_TARGET` | **震荡策略止盈目标**: `'middle'` (中轨) 或 `'opposite'` (反向轨道)。 |
+| `RANGING_STOP_LOSS_ATR_MULTIPLIER` | **震荡策略ATR止损乘数**: 止损距离为此ATR倍数。 |
+| **实验性功能** | |
+| `ENABLE_PERFORMANCE_FEEDBACK`| **启用性能反馈**: `True` 会根据历史交易表现（胜率、盈亏比等）在两套参数间动态切换 (实验性)。 |
+| `AGGRESSIVE_PARAMS` | **激进参数集**: 机器人表现良好时采用的参数，通常止损更近、加仓更积极。 |
+| `DEFENSIVE_PARAMS` | **保守参数集**: 机器人表现不佳时采用的参数，通常止损更远、加仓更保守。 |
+
+### `FuturesSettings` (合约特定设置)
+
+| 参数名 | 中文注释和功能说明 |
+| :--- | :--- |
+| **核心风控参数** | |
+| `FUTURES_LEVERAGE` | **杠杆倍数**: 为您所有交易对设置的杠杆倍数。 |
+| `FUTURES_MARGIN_MODE` | **保证金模式**: `'isolated'` (逐仓) 或 `'cross'` (全仓)。建议使用 `'isolated'` 以隔离风险。 |
+| `FUTURES_RISK_PER_TRADE_PERCENT` | **单笔风险百分比**: （仅用于趋势策略）根据此百分比和止损距离计算开仓大小，是核心风控。 |
+| `MAX_MARGIN_PER_TRADE_RATIO` | **最大保证金占用率**: **非常重要的风控参数**。单笔开仓所需保证金不得超过总权益的此比例，防止单次重仓。 |
+| `MIN_NOMINAL_VALUE_USDT` | **最小名义价值**: 交易所允许的最小开仓价值（USDT）。如果计算出的仓位价值低于此值，会自动调整。 |
+| `USE_ATR_FOR_INITIAL_STOP` | **使用ATR计算初始止损**: `True` 使用ATR动态计算初始止损，`False` 使用固定百分比。 |
+| `INITIAL_STOP_ATR_MULTIPLIER` | **初始止损ATR乘数**: 初始止损距离 = ATR * 此乘数。 |
+| `FUTURES_STATE_DIR` | **状态文件目录**: 用于存储仓位和利润历史记录的文件夹名称。 |
+| **仓位管理与止损策略** | |
+| `PYRAMIDING_ENABLED` | **启用金字塔加仓**: `True` 允许在盈利的趋势头寸上进行加仓。 |
+| `PYRAMIDING_MAX_ADD_COUNT` | **最大加仓次数**: 一笔初始订单最多允许加仓的次数。 |
+| `PYRAMIDING_ADD_SIZE_RATIO`| **加仓大小比例**: 每次加仓的数量是上一笔开仓/加仓数量的此比例。 |
+| `TREND_EXIT_ADJUST_SL_ENABLED`| **启用趋势分歧止损调整**: 当短期趋势与宏观趋势不一致时，是否收紧止损。 |
+| `TREND_EXIT_CONFIRMATION_COUNT`| **趋势分歧确认K线数**: 需要连续多少根K线出现趋势分歧，才触发止损调整。 |
+| `TREND_EXIT_ATR_MULTIPLIER`| **趋势分歧止损ATR乘数**: 触发分歧时，将止损调整至 `现价 +/- ATR * 此乘数` 的位置。 |
+| `ADAPTIVE_TRAILING_STOP_ENABLED`| **启用自适应追踪止损**: `True` 会根据短期和长期波动率的比值，动态调整追踪止损的ATR乘数。 |
+| `TRAILING_STOP_MIN_UPDATE_SECONDS`| **追踪止损最小更新间隔**: 止损位更新的最小时间间隔（秒），防止过于频繁的更新。 |
+| `CHANDELIER_EXIT_ENABLED`| **启用吊灯止损**: `True` 在盈利达到一定程度后，切换到更灵敏的吊灯止损模式以保护利润。 |
+| `CHANDELIER_ACTIVATION_PROFIT_MULTIPLE`| **吊灯止损激活盈利倍数**: 当浮动盈利达到 `初始风险(R) * 此倍数` 时，从普通ATR追损切换为吊灯止损。 |
+| `CHANDELIER_PERIOD` | **吊灯止损计算周期**: 用于计算吊灯止损的高点/低点的回看周期。 |
+| `CHANDELIER_ATR_MULTIPLIER`| **吊灯止损ATR乘数**: 吊灯止损的回撤距离 = ATR * 此乘数。 |
+| `ENABLE_EXHAUSTION_ALERT`| **启用趋势衰竭预警**: `True` 会监控ADX是否持续下降，若成立则提前将止损移动到保本位置。 |
+| `EXHAUSTION_ADX_FALLING_BARS`| **ADX连续下降K线数**: ADX需要连续多少根K线回落才视为衰竭信号。 |
+| `ENABLE_REVERSAL_SIGNAL_ALERT` | **启用危险反转信号预警**: `True` 会监控是否存在成交量和实体都很大的反向K线，若存在则立即收紧止损。 |
+| `REVERSAL_ALERT_BODY_ATR_MULTIPLIER` | **反转K线实体ATR乘数**: 反向K线实体需超过此倍数的ATR。 |
+| `REVERSAL_ALERT_VOLUME_MULTIPLE`| **反转K线成交量乘数**: 反向K线成交量需超过此倍数的平均成交量。 |
+
+
+
+## 🚀 如何使用
 ### 1. 环境准备
-
--   Python 3.10 或更高版本
--   一个币安账户（建议先在测试网注册）并创建API密钥
--   (可选) 在您的iOS设备上安装Bark应用以接收通知
-
-### 2. 安装
-
-1.  **克隆代码仓库:**
-
-    ```bash
-    git clone https://github.com/hzy11fk/Adaptive-Trend-Bot.git
-    cd Adaptive-Trend-Bot
+- Python 3.10 或更高版本。
+# 克隆项目
+  ```bash
+- git clone https://github.com/hzy11fk/Adaptive-Trend-Bot.git
+- cd Adaptive-Trend-Bot
+   ```
+# 创建虚拟环境
+  ```bash
+python -m venv .venv
+   ```
+# 激活虚拟环境
+# Windows:
+  ```bash
+.\.venv\Scripts\activate
+   ```
+# Linux/Mac:
+  ```bash
+source .venv/bin/activate
+   ```
+- 安装所需的库:
+  ```bash
+  pip install ccxt pandas numpy python-dotenv pydantic pydantic-settings aiohttp requests
+  ```
+### 2. 配置
+1.  **创建 `.env` 文件**: 在项目根目录下创建一个名为 `.env` 的文本文件。
+2.  **填入密钥**: 在 `.env` 文件中，按以下格式填入您的API密钥和Bark密钥：
+    ```dotenv
+    BINANCE_API_KEY=YOUR_MAINNET_API_KEY
+    BINANCE_SECRET_KEY=YOUR_MAINNET_SECRET_KEY
+    BINANCE_TESTNET_API_KEY=YOUR_TESTNET_API_KEY
+    BINANCE_TESTNET_SECRET_KEY=YOUR_TESTNET_SECRET_KEY
+    BARK_URL_KEY=YOUR_BARK_PUSH_URL_KEY
     ```
-
-2.  **安装所需的Python库:**
- 
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-### 3. 配置
-
-1.  **创建 `.env` 文件:**
-    在项目的根目录下，创建一个名为 `.env` 的文件。
-
-2.  **编辑 `.env` 文件:**
-    将以下内容复制到 `.env` 文件中，并填入您自己的密钥信息。
-
-    ```env
-    # --- 币安实盘账户 API 密钥 ---
-    BINANCE_API_KEY="你的实盘API_KEY"
-    BINANCE_SECRET_KEY="你的实盘SECRET_KEY"
-
-    # --- 币安测试网账户 API 密钥 (在 [https://testnet.binancefuture.com/](https://testnet.binancefuture.com/) 申请) ---
-    BINANCE_TESTNET_API_KEY="你的测试网API_KEY"
-    BINANCE_TESTNET_SECRET_KEY="你的测试网SECRET_KEY"
-
-    # --- Bark 推送服务的 URL Key (可选) ---
-    # 示例: "[https://api.day.app/你的BARK设备KEY/](https://api.day.app/你的BARK设备KEY/)"
-    BARK_URL_KEY="你的BARK_URL_WITH_KEY"
-    ```
-
-3.  **调整 `config.py` 中的策略参数:**
-    打开 `config.py` 文件，您可以精细地调整策略的每一个细节。关键配置项包括：
-    -   `USE_TESTNET`: 设置为 `True` 使用测试网，`False` 则使用实盘（**请务必先在测试网充分测试！**）。
-    -   `FUTURES_SYMBOLS_LIST`: 您希望机器人交易的币对列表，例如 `["BTC/USDT:USDT", "ETH/USDT:USDT"]`。
-    -   `FUTURES_INITIAL_PRINCIPAL`: 您的初始本金，用于精确计算盈亏率。
-    -   `FUTURES_LEVERAGE` 和 `FUTURES_RISK_PER_TRADE_PERCENT`: 核心的风险管理参数。
-  
-## 配置参数详解 (`config.py`)
-
-机器人所有的行为和策略都由该文件中的参数控制。理解每个参数的作用是进行策略调优和风险管理的关键。
-
-### 全局设置 (`Settings`)
-
-这部分主要负责全局开关、API密钥加载、趋势判断的核心参数等。
-
-| 参数名                                     | 功能说明                                                                                                                     |
-| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| **模式与交易对** |                                                                                                                                        |
-| `USE_TESTNET`                              | **测试网开关**：`True` 表示使用币安测试网进行模拟交易，`False` 表示使用实盘账户。**强烈建议新用户先设为 `True`**。                   |
-| `FUTURES_SYMBOLS_LIST`                     | **交易对列表**：您希望机器人交易的币对列表，例如 `["BTC/USDT:USDT", "ETH/USDT:USDT"]`。                                                              |
-| `FUTURES_INITIAL_PRINCIPAL`                | **初始本金**：您投入该策略的初始总资金（USDT），用于精确计算总盈亏率和性能指标。                                                         |
-| **API与通知** |                                                                                                                                        |
-| `BINANCE...KEY`                            | **API密钥**：从 `.env` 文件中加载您的币安实盘和测试网API密钥。                                                                            |
-| `BARK_URL_KEY`                             | **Bark推送密钥**：从 `.env` 文件中加载您的Bark App推送地址，用于发送交易通知。                                                            |
-| **核心趋势判断** |                                                                                                                                        |
-| `TREND_SIGNAL_TIMEFRAME`                   | **信号周期**：用于生成主要交易信号的K线时间周期，例如 `'5m'` (5分钟)。                                                                   |
-| `TREND_FILTER_TIMEFRAME`                   | **过滤周期**：用于确认宏观趋势的较长K线时间周期，例如 `'15m'` (15分钟)。                                                                 |
-| `TREND_SHORT_MA_PERIOD`                    | **短期均线周期**：在“信号周期”上计算的短期移动平均线周期。                                                                               |
-| `TREND_LONG_MA_PERIOD`                     | **长期均线周期**：在“信号周期”上计算的长期移动平均线周期。快慢均线的交叉关系是判断趋势的基础。                                           |
-| `TREND_FILTER_MA_PERIOD`                   | **过滤均线周期**：在“过滤周期”上计算的移动平均线，用于判断当前价格处于宏观的多头还是空头环境。                                           |
-| `TREND_ADX_THRESHOLD_STRONG`               | **强趋势ADX阈值**：ADX指标超过此值，表示趋势非常强劲。                                                                                   |
-| `TREND_ADX_THRESHOLD_WEAK`                 | **弱趋势ADX阈值**：ADX指标低于此值，表示趋势非常弱或处于盘整。                                                                           |
-| `TREND_ATR_MULTIPLIER...`                  | **动态阈值ATR乘数**：根据ADX判断的趋势强弱，使用不同的ATR乘数来动态调整MA均线差值的判断阈值，强趋势时要求更低，弱趋势时要求更高。     |
-| **趋势确认与增强** |                                                                                                                                        |
-| `ENABLE_TREND_MEMORY`                      | **趋势记忆开关**：`True` 开启趋势“宽限期”功能。一旦一个趋势通过严格确认，即使短期信号消失，策略也会在几根K线内“记住”这个趋势方向。 |
-| `TREND_CONFIRMATION_GRACE_PERIOD`          | **趋势宽限期K线数**：在趋势记忆开启时，已确认的趋势可以维持多少根K线。                                                                   |
-| `TREND_VOLUME_CONFIRM_PERIOD`              | **成交量均线周期**：用于计算成交量移动平均线(VMA)的周期，作为成交量确认的基准。                                                           |
-| `TREND_RSI_CONFIRM_PERIOD`                 | **RSI周期**：用于计算RSI指标的周期。                                                                                                     |
-| `TREND_RSI_UPPER_BOUND`                    | **RSI上限**：在看涨趋势确认时，要求RSI值低于此数值，避免在超买区域追高。                                                                 |
-| `TREND_RSI_LOWER_BOUND`                    | **RSI下限**：在看跌趋势确认时，要求RSI值高于此数值，避免在超卖区域杀跌。                                                                 |
-| **动态成交量** |                                                                                                                                        |
-| `DYNAMIC_VOLUME_ENABLED`                   | **动态成交量开关**：`True` 开启后，用于确认趋势的成交量阈值将根据市场近期波动率（ATR比率）动态调整。                                     |
-| `DYNAMIC_VOLUME_BASE_MULTIPLIER`           | **基础成交量乘数**：在动态成交量关闭时，或作为动态计算的基础值。要求成交量必须大于 `VMA * 此乘数`。                                       |
-| `DYNAMIC_VOLUME_ATR_PERIOD...`             | **动态成交量ATR周期**：用于计算短期和长期ATR以得出市场波动率比率的周期。                                                                 |
-| `DYNAMIC_VOLUME_ADJUST_FACTOR`             | **动态成交量调整因子**：波动率比率对基础成交量乘数的具体影响程度。                                                                       |
-| **激进模式：突破与激增信号** |                                                                                                                                        |
-| `ENABLE_BREAKOUT_MODIFIER`                 | **突破信号开关**：`True` 开启布林带突破侦测功能。                                                                                        |
-| `BREAKOUT_TIMEFRAME`                       | **突破信号周期**：用于计算布林带的K线时间周期。                                                                                          |
-| `BREAKOUT_BBANDS_PERIOD`                   | **布林带周期**：计算布林带中轨（MA）的周期。                                                                                             |
-| `BREAKOUT_BBANDS_STD_DEV`                  | **布林带标准差**：布林带上下轨的标准差倍数。                                                                                             |
-| `BREAKOUT_GRACE_PERIOD_SECONDS`            | **突破宽限期(秒)**：侦测到突破信号后，策略进入“激进模式”的持续时间。                                                                     |
-| `AGGRESSIVE_PULLBACK_ZONE_MULTIPLIER`      | **激进回调区乘数**：在“激进模式”下，回调入场区的宽度会乘以该系数，变得更大，更容易成交。                                                 |
-| `AGGRESSIVE_RELAXED_VOLUME_MULTIPLIER`     | **激进成交量乘数**：在“激进模式”下，趋势确认所需的成交量阈值会乘以该系数（通常小于1），变得更宽松。                                     |
-| `ENABLE_SPIKE_MODIFIER`                    | **激增信号开关**：`True` 开启K线实体和成交量激增的侦测功能。                                                                              |
-| `SPIKE_TIMEFRAME`                          | **激增信号周期**：用于侦测激增的K线时间周期。                                                                                            |
-| `SPIKE_BODY_ATR_MULTIPLIER`                | **激增K线实体ATR乘数**：要求K线实体大小必须超过 `ATR * 此乘数`。                                                                         |
-| `SPIKE_VOLUME_MULTIPLIER`                  | **激增成交量乘数**：要求实时成交量必须超过 `VMA * 此乘数`。                                                                              |
-| `SPIKE_GRACE_PERIOD_SECONDS`               | **激增宽限期(秒)**：侦测到激增信号后，策略进入“超级激进模式”的持续时间。                                                                 |
-| `SUPER_AGGRESSIVE_PULLBACK_ZONE_MULTIPLIER`| **超级激进回调区乘数**：在“超级激进模式”下，回调区的放大倍数，比普通激进模式更激进。                                                     |
-| `SUPER_AGGRESSIVE_RELAXED_VOLUME_MULTIPLIER` | **超级激进成交量乘数**：在“超级激进模式”下，成交量阈值的放宽系数，比普通激进模式更宽松。                                                 |
-| `SPIKE_ENTRY_GRACE_PERIOD_MINUTES`         | **激增入场保护期(分钟)**：对于因“激增”信号开的仓位，在此保护期内，即使趋势与持仓不符，也不会触发防御性止损。                               |
-| **策略自适应系统** |                                                                                                                                        |
-| `ENABLE_PERFORMANCE_FEEDBACK`              | **表现反馈开关**：`True` 开启策略的自适应调参功能。机器人会根据历史业绩自动在“激进”和“防御”参数集之间动态调整。                     |
-| `PERFORMANCE_CHECK_INTERVAL_HOURS`         | **表现检查间隔(小时)**：每隔多少小时重新评估一次策略表现并调整参数。                                                                     |
-| `MIN_TRADES_FOR_EVALUATION`                | **最少评估交易次数**：在进行参数自适应前，至少需要积累的交易笔数。                                                                       |
-| `PERF_WEIGHT_WIN_RATE`                     | **表现评分权重：胜率**：在计算综合表现分时，胜率所占的比重。                                                                             |
-| `PERF_WEIGHT_PAYOFF_RATIO`                 | **表现评分权重：盈亏比**：盈亏比所占的比重。                                                                                             |
-| `PERF_WEIGHT_DRAWDOWN`                     | **表现评分权重：最大回撤**：最大回撤所占的比重。                                                                                         |
-| `AGGRESSIVE_PARAMS`                        | **激进参数集**：一个字典，当策略表现得分高时，会趋向于采用这套参数（例如，更窄的回调区，更灵敏的ATR止损）。                               |
-| `DEFENSIVE_PARAMS`                         | **防御参数集**：一个字典，当策略表现得分低时，会趋向于采用这套参数（例如，更宽的回调区，更宽松的ATR止损）。                               |
-
-### 合约交易设置 (`FuturesSettings`)
-
-这部分专门存放与合约交易行为直接相关的参数，如杠杆、风险管理、止损、加仓等。
-
-| 参数名                                   | 中文注释和功能说明                                                                                                             |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| **核心交易参数** |                                                                                                                                |
-| `FUTURES_LEVERAGE`                       | **杠杆倍数**：为您所有交易对设置的杠杆倍数。                                                                                     |
-| `FUTURES_MARGIN_MODE`                    | **保证金模式**：`'isolated'` (逐仓) 或 `'crossed'` (全仓)。建议使用 `'isolated'` 以隔离风险。                                     |
-| `FUTURES_RISK_PER_TRADE_PERCENT`         | **单笔交易风险比例**：每次开仓时，您愿意承担的风险占总权益的百分比。该参数是决定开仓大小的核心。                                   |
-| `FUTURES_STOP_LOSS_PERCENT`              | **初始止损百分比**：根据开仓价设置的初始止损距离。例如 `2.5` 表示止损设置在开仓价下方2.5%。                                        |
-| **入场与状态管理** |                                                                                                                                |
-| `FUTURES_ENTRY_PULLBACK_EMA_PERIOD`      | **回调入场EMA周期**：用于计算回调区域中心线的EMA均线周期。                                                                       |
-| `FUTURES_STATE_DIR`                      | **状态文件目录**：用于存放持仓状态和利润记录 `.json` 文件的目录名。                                                              |
-| **防御性止损** |                                                                                                                                |
-| `TREND_EXIT_ADJUST_SL_ENABLED`           | **防御性止损开关**：`True` 开启后，如果持仓方向与当前市场趋势连续多次不符，会自动收紧止损以控制风险。                           |
-| `TREND_EXIT_CONFIRMATION_COUNT`          | **趋势不符确认次数**：需要连续多少根K线的趋势判断与持仓方向不符，才会触发防御性止损。                                              |
-| `TREND_EXIT_ATR_MULTIPLIER`              | **防御止损ATR乘数**：触发防御性止损时，新的止损位将设置在 `当前价 ± ATR * 此乘数` 的位置，通常比追踪止损更紧。                       |
-| **金字塔加仓** |                                                                                                                                |
-| `PYRAMIDING_ENABLED`                     | **金字塔加仓开关**：`True` 开启浮盈加仓功能。                                                                                    |
-| `PYRAMIDING_MAX_ADD_COUNT`               | **最大加仓次数**：在一个盈利的头寸上，最多允许进行多少次加仓操作。                                                               |
-| `PYRAMIDING_ADD_SIZE_RATIO`              | **加仓规模比例**：每次加仓的数量是上一次开仓（或加仓）数量的百分比。例如 `0.75` 表示每次加仓75%，形成倒金字塔。               |
-| **两阶段动态止损** |                                                                                                                                |
-| `CHANDELIER_EXIT_ENABLED`                | **两阶段止损开关**：`True` 开启智能两阶段止损系统（ATR追踪 -> 吊灯止损）。                                                      |
-| `CHANDELIER_ACTIVATION_PROFIT_MULTIPLE`  | **吊灯止损激活盈利倍数**：当浮动盈利达到初始风险(1R)的多少倍时，止损模式从第一阶段自动升级为第二阶段的“吊灯止损”。               |
-| `CHANDELIER_PERIOD`                      | **吊灯止损回顾周期**：用于计算N周期内最高价/最低价的周期数。对于15分钟图，`16` 是一个不错的起点（回顾过去4小时）。               |
-| `CHANDELIER_ATR_MULTIPLIER`              | **吊灯止损ATR乘数**：吊灯止损计算公式中使用的ATR乘数，数值越大，止损越宽松，能给趋势更多“呼吸空间”。常用值为 `3`。               |
+    如果您只想使用主网，测试网密钥可以留空，反之亦然。
+    确保从币安官网获取API Key时，勾选了“允许合约”权限。
 
 
 
-## 如何运行
+3.  **调整 `config.py`**: 根据您的交易偏好和风险承受能力，仔细检查并调整 `config.py` 文件中的各个参数值。强烈建议在实盘前，先使用测试网和模拟交易进行充分验证。
 
-
-1.  **启动机器人:**
-    在您的终端中运行 `main.py` 脚本：
-    
+### 3. 运行实盘交易
+1.  **确认配置**: 确保 `config.py` 中的 `USE_TESTNET = False`。
+2.  **启动程序**: 在终端中运行主入口文件：
     ```bash
     python main.py
     ```
+    程序启动后，会初始化交易所连接，为每个配置的交易对创建交易员实例，然后启动Web服务器和所有交易员的主循环。
+3.  **监控**: 打开浏览器，访问 `http://<您的服务器IP>:58182` (默认端口，可在 `web_server.py` 中修改) 即可看到实时监控界面。同时，您的Bark App也会收到交易通知。
+4.  **停止**: 在运行程序的终端中按下 `Ctrl + C` 可以优雅地停止程序。
 
-2.  **通过Web UI监控:**
-    机器人启动后，打开您的浏览器，访问终端日志中显示的地址，通常是：
-    **`http://0.0.0.0:58182`** 或 **`http://localhost:58182`**
-
-现在，您的交易机器人已经正式上线。它将开始分析市场并根据设定的策略执行交易。所有操作都会被记录到控制台、`logs/`目录下的日志文件以及Web UI中。
-
-## 免责声明
-
-加密货币交易涉及巨大风险，可能不适合所有投资者。本软件的作者不对您可能遭受的任何财务损失负责。请自行承担使用此机器人的风险，并仅使用您能够承受损失的资金进行交易。强烈建议在投入真实资金之前，先在**币安测试网**上进行充分的测试和验证。
-
+### 4. 运行前瞻性测试 (模拟交易)
+1.  **确认配置**: 您可以选择在主网 (`USE_TESTNET = False`) 或测试网 (`USE_TESTNET = True`) 的实时数据上进行模拟。强烈推荐创建一个只有“允许读取”权限的API Key 用于模拟测试，以确保100%安全。
+2.  **启动脚本**: 在终端中运行模拟交易脚本：
+    ```bash
+    python paper_trader.py
+    ```
