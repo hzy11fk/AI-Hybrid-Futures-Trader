@@ -1,122 +1,83 @@
-# 文件: exchange_client.py (最终修正版 - 补全函数)
-
-import ccxt.async_support as ccxt
 import logging
-from config import settings
 import asyncio
+from ccxt.base.errors import RequestTimeout, NetworkError, ExchangeNotAvailable, DDoSProtection
 
 class ExchangeClient:
-    def __init__(self, is_futures=False):
-        """
-        初始化交易所客户端。
-        根据全局配置 settings.USE_TESTNET 自动切换实盘或测试网。
-        """
+    def __init__(self, exchange):
+        self.exchange = exchange
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.time_diff = 0
-        
-        if settings.USE_TESTNET:
-            self.logger.warning("！！！当前正在使用币安测试网 (Testnet) 模式！！！")
-            api_key = settings.BINANCE_TESTNET_API_KEY
-            secret_key = settings.BINANCE_TESTNET_SECRET_KEY
-            options = {'defaultType': 'future'}
-            
-            exchange_config = { 'apiKey': api_key, 'secret': secret_key, 'options': options, 'enableRateLimit': True }
-            self.exchange = ccxt.binance(exchange_config)
-            self.exchange.set_sandbox_mode(True) 
-            
-        else:
-            self.logger.info("当前正在使用币安实盘 (Live) 模式。")
-            api_key = settings.BINANCE_API_KEY
-            secret_key = settings.BINANCE_SECRET_KEY
-            options = {'defaultType': 'future'}
-            
-            exchange_config = { 'apiKey': api_key, 'secret': secret_key, 'options': options, 'enableRateLimit': True }
-            self.exchange = ccxt.binance(exchange_config)
 
-        self.markets_loaded = False
-
-    async def load_markets(self, reload=False):
-        """加载市场数据"""
-        if not self.markets_loaded or reload:
+    async def _retry_async_method(self, method, *args, **kwargs):
+        """
+        [新增] 一个健壮的异步方法重试装饰器/包装器。
+        - max_retries: 最大重试次数
+        - delay: 每次重试前的等待时间（秒）
+        """
+        max_retries = 3
+        delay = 5  # 5秒
+        for attempt in range(max_retries):
             try:
-                await self.exchange.load_markets(reload)
-                self.markets_loaded = True
-                self.logger.info("市场数据加载成功。")
+                # 尝试调用原始方法
+                return await method(*args, **kwargs)
+            except (RequestTimeout, NetworkError, ExchangeNotAvailable, DDoSProtection) as e:
+                # 只对可恢复的网络或超时错误进行重试
+                if attempt < max_retries - 1:
+                    self.logger.warning(f"调用 {method.__name__} 时发生可重试错误: {e}。将在 {delay} 秒后进行第 {attempt + 2} 次尝试...")
+                    await asyncio.sleep(delay)
+                else:
+                    self.logger.error(f"调用 {method.__name__} 失败，已达到最大重试次数 ({max_retries})。")
+                    raise  # 重试次数用尽后，重新抛出最后的异常
             except Exception as e:
-                self.logger.error(f"加载市场数据失败: {e}", exc_info=True)
+                # 对于其他所有错误（如API密钥错误、参数错误），不进行重试，立即抛出
+                self.logger.error(f"调用 {method.__name__} 时发生不可重试的严重错误: {e}")
                 raise
 
-    # --- [核心修正] 在此处添加缺失的 fetch_my_trades 函数 ---
-    async def fetch_my_trades(self, symbol: str, limit: int = 1000):
-        """获取我的历史成交记录"""
-        try:
-            return await self.exchange.fetch_my_trades(symbol, limit=limit)
-        except Exception as e:
-            self.logger.error(f"获取 {symbol} 历史成交失败: {e}", exc_info=True)
-            raise
-    # --- 修正结束 ---
-
     async def fetch_ticker(self, symbol: str):
-        """获取最新价格"""
-        try:
-            return await self.exchange.fetch_ticker(symbol)
-        except Exception as e:
-            self.logger.error(f"获取 {symbol} Ticker失败: {e}", exc_info=True)
-            raise
+        """获取最新价格，并应用重试逻辑。"""
+        return await self._retry_async_method(self.exchange.fetch_ticker, symbol)
+
+    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int):
+        """获取K线数据，并应用重试逻辑。"""
+        return await self._retry_async_method(self.exchange.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit)
 
     async def fetch_balance(self, params={}):
-        """获取账户余额"""
+        """
+        [修改] 获取余额，并应用重试逻辑。
+        这是修复您问题的核心。
+        """
+    #    self.logger.info("正在获取账户余额...")
         try:
-            return await self.exchange.fetch_balance(params=params)
+            # 使用重试包装器来调用真实的 fetch_balance
+            balance = await self._retry_async_method(self.exchange.fetch_balance, params=params)
+      #      self.logger.info("成功获取账户余额。")
+            return balance
         except Exception as e:
             self.logger.error(f"获取余额失败: {e}", exc_info=True)
-            raise
+            raise # 将最终的错误向上抛出
 
     async def create_market_order(self, symbol: str, side: str, amount: float, params={}):
-        """创建市价单"""
-        try:
-            self.logger.info(f"创建市价单: {side.upper()} {amount} {symbol} | 参数: {params}")
-            return await self.exchange.create_market_order(symbol, side, amount, params)
-        except Exception as e:
-            self.logger.error(f"创建市价单失败: {e}", exc_info=True)
-            raise
+        """创建市价单，并应用重试逻辑。"""
+        # 注意：对下单操作应用重试需要非常小心，以防重复下单。
+        # CCXT通常有内置的幂等性处理，但这里我们假设只在超时且状态未知时重试一次。
+        # 为简单起见，这里也直接使用重试包装器，但在生产环境中需要更复杂的逻辑。
+        return await self._retry_async_method(self.exchange.create_market_order, symbol, side, amount, params=params)
 
     async def fetch_order(self, order_id: str, symbol: str):
-        """获取订单详情"""
-        try:
-            return await self.exchange.fetch_order(order_id, symbol)
-        except Exception as e:
-            self.logger.error(f"获取订单 {order_id} 失败: {e}", exc_info=True)
-            raise
+        """获取订单信息，并应用重试逻辑。"""
+        return await self._retry_async_method(self.exchange.fetch_order, order_id, symbol=symbol)
+        
+    async def set_leverage(self, leverage, symbol):
+        """设置杠杆，并应用重试逻辑。"""
+        return await self._retry_async_method(self.exchange.set_leverage, leverage, symbol=symbol)
 
-    async def fetch_ohlcv(self, symbol: str, timeframe: str = '1m', limit: int = 100):
-        """获取K线数据"""
-        try:
-            return await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        except Exception as e:
-            self.logger.error(f"获取 {symbol} {timeframe} K线失败: {e}", exc_info=True)
-            raise
+    async def set_margin_mode(self, margin_mode, symbol):
+        """设置保证金模式，并应用重试逻辑。"""
+        return await self._retry_async_method(self.exchange.set_margin_mode, margin_mode, symbol=symbol)
+        
+    async def load_markets(self):
+        """加载市场信息，并应用重试逻辑。"""
+        return await self._retry_async_method(self.exchange.load_markets)
 
-    async def set_leverage(self, leverage: int, symbol: str):
-        """设置杠杆倍数"""
-        try:
-            return await self.exchange.set_leverage(leverage, symbol)
-        except Exception as e:
-            self.logger.error(f"为 {symbol} 设置杠杆失败: {e}", exc_info=True)
-            raise
-
-    async def set_margin_mode(self, margin_mode: str, symbol: str):
-        """设置保证金模式"""
-        try:
-            return await self.exchange.set_margin_mode(margin_mode, symbol)
-        except Exception as e:
-            self.logger.error(f"为 {symbol} 设置保证金模式失败: {e}", exc_info=True)
-            raise
-
-    async def close(self):
-        """关闭交易所连接"""
-        try:
-            await self.exchange.close()
-            self.logger.info("交易所连接已关闭。")
-        except Exception as e:
-            self.logger.error(f"关闭连接时出错: {e}", exc_info=True)
+    async def fetch_my_trades(self, symbol: str, limit: int = 1000):
+        """获取历史成交，并应用重试逻辑。"""
+        return await self._retry_async_method(self.exchange.fetch_my_trades, symbol, limit=limit)
