@@ -1,4 +1,3 @@
-# GridBNB-USDT依赖库 (适配Python 3.13.1)
 aiohttp>=3.9.1
 aiofiles>=23.2.1
 ccxt>=4.1.0
@@ -19,3 +18,20 @@ passlib>=1.7.4
 python-multipart>=0.0.6
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
+# --- 核心交易与数据分析 ---
+ccxt>=4.1.0                 # 用于连接交易所
+pandas>=2.2.0             # 用于数据处理和技术指标
+pandas-ta>=0.3.14b        # 用于计算技术分析指标
+numpy>=1.26.0             # pandas 的依赖，用于数值计算
+requests>=2.31.0          # 用于调用恐惧贪婪指数 API
+
+# --- AI 分析 ---
+openai>=1.3.0             # 用于连接 OpenAI, Azure, DeepSeek 等
+
+# --- 配置管理 ---
+pydantic>=2.5.0           # 用于配置模型验证
+pydantic-settings>=2.1.0  # 用于从 .env 加载配置
+python-dotenv>=1.0.0      # 用于加载 .env 文件
+
+# --- Web 服务器与监控 ---
+aiohttp>=3.9.1            # 用于异步 Web 服务器 (UI 监控面板)
